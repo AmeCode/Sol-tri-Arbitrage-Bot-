@@ -10,8 +10,6 @@ export const CFG = {
     // Jito
     jitoRpc: process.env.JITO_RPC,
     // Jupiter
-    jupiterBase: process.env.JUPITER_BASE ?? 'https://quote-api.jup.ag',
-    jupiterPlatformFeeBps: Number(process.env.JUPITER_PLATFORM_FEE_BPS ?? 0),
     // Universe
     tokensUniverse: (process.env.TOKENS ?? '').split(',').map(s => s.trim()).filter(Boolean),
     seedInBase: BigInt(process.env.SEED_IN_BASE ?? '1000000'),
