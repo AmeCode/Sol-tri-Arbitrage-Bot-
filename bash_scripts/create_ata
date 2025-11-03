@@ -1,0 +1,10 @@
+for MINT in $MINT_SOL $MINT_USDC $MINT_USDT $MINT_BONK $MINT_JUP $MINT_MSOL; do
+  echo "=== $MINT ==="
+  spl-token accounts --owner $PUBKEY | grep -q $MINT
+  if [ $? -ne 0 ]; then
+    echo "Creating ATA for $MINT ..."
+    spl-token create-account $MINT --owner $PUBKEY --fee-payer $WALLET
+  else
+    echo "ATA exists."
+  fi
+done
