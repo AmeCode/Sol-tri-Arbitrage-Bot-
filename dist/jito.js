@@ -1,11 +1,9 @@
-import { JitoRpcClient } from 'jito-js-rpc';
-export function jitoClient(url) {
-    return new JitoRpcClient({ url });
-}
-export async function simulateBundle(jito, base64Txs) {
-    return jito.simulateBundle({ transactions: base64Txs });
-}
-export async function sendBundle(jito, base64Txs) {
-    return jito.sendBundle({ transactions: base64Txs });
+import { searcherClient } from 'jito-ts/dist/sdk/block-engine/searcher.js';
+/** Create a Searcher client for Jito Block Engine (no auth key needed). */
+export function makeJitoClient(blockEngineUrl, _auth) {
+    if (!blockEngineUrl)
+        throw new Error('BLOCK_ENGINE_URL missing');
+    // Pass undefined for auth to use public access
+    return searcherClient(blockEngineUrl, undefined);
 }
 //# sourceMappingURL=jito.js.map

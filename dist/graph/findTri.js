@@ -1,28 +1,27 @@
-export async function findTriCandidates(edges, seed) {
-    const byFrom = new Map();
-    for (const e of edges) {
-        if (!byFrom.has(e.from))
-            byFrom.set(e.from, []);
-        byFrom.get(e.from).push(e);
-    }
-    const res = [];
-    for (const e1 of edges) {
-        const o1 = await e1.quoteOut(seed);
-        if (o1 <= 0n)
-            continue;
-        for (const e2 of (byFrom.get(e1.to) ?? [])) {
-            const o2 = await e2.quoteOut(o1);
-            if (o2 <= 0n)
+export async function findTriCandidates(edges, seedInBase) {
+    // trivial triple-nested candidate builder; you can cache adjacency if you want
+    const out = [];
+    for (const a of edges)
+        for (const b of edges) {
+            if (a.to !== b.from)
                 continue;
-            for (const e3 of (byFrom.get(e2.to) ?? [])) {
-                if (e3.to !== e1.from)
+            for (const c of edges) {
+                if (b.to !== c.from)
                     continue;
-                const o3 = await e3.quoteOut(o2);
-                if (o3 > seed)
-                    res.push([e1, e2, e3]);
+                if (c.to !== a.from)
+                    continue;
+                // quick re-quote to gate out dead paths (fast path)
+                const q1 = await a.quoteOut(seedInBase);
+                if (q1 <= 0n)
+                    continue;
+                const q2 = await b.quoteOut(q1);
+                if (q2 <= 0n)
+                    continue;
+                const q3 = await c.quoteOut(q2);
+                if (q3 > seedInBase)
+                    out.push([a, b, c]);
             }
         }
-    }
-    return res;
+    return out;
 }
 //# sourceMappingURL=findTri.js.map

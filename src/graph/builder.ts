@@ -2,7 +2,8 @@ import { PublicKey } from '@solana/web3.js';
 import { PoolEdge } from './types.js';
 import { CFG } from '../config.js';
 import { makeConnections } from '../rpc.js';
-import { WsAccountCache } from '../utils/wsCache.js';
+// Use the util/wsCache file instead of a non-existent utils directory.
+import { WsAccountCache } from '../util/wsCache.js';
 import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
 import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
 import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
@@ -37,8 +38,8 @@ export async function buildEdges(): Promise<PoolEdge[]> {
     const poolPk = new PublicKey(p.id);
     cache.subscribe(poolPk);
     edges.push(
-      { ...makeOrcaEdge(p.id, p.a, p.b, orcaCtx, cache), from: p.a, to: p.b },
-      { ...makeOrcaEdge(p.id, p.a, p.b, orcaCtx, cache), from: p.b, to: p.a }
+      { ...makeOrcaEdge(p.id, p.a, p.b, orcaCtx), from: p.a, to: p.b },
+      { ...makeOrcaEdge(p.id, p.a, p.b, orcaCtx), from: p.b, to: p.a }
     );
   }
 

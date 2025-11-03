@@ -1,18 +1,31 @@
 import { PublicKey, TransactionInstruction } from '@solana/web3.js';
-import { WhirlpoolContext, ORCA_WHIRLPOOL_PROGRAM_ID, buildWhirlpoolClient, swapQuoteByInputToken, increaseComputeBudgetIx, PDAUtil, WhirlpoolData } from '@orca-so/whirlpools-sdk';
-import Decimal from 'decimal.js';
+import {
+  WhirlpoolContext,
+  ORCA_WHIRLPOOL_PROGRAM_ID,
+  buildWhirlpoolClient,
+  swapQuoteByInputToken,
+} from '@orca-so/whirlpools-sdk';
+import Decimal from 'decimal.js-light';
+import { Percentage } from '@orca-so/common-sdk';
 import { PoolEdge } from '../graph/types.js';
-import { WsAccountCache } from '../utils/wsCache.js';
 import { CFG } from '../config.js';
 
-export function makeOrcaEdge(whirlpool: string, mintA: string, mintB: string, ctx: WhirlpoolContext, cache: WsAccountCache): PoolEdge {
+/**
+ * Create an Orca Whirlpool PoolEdge (both directions are created by builder.ts).
+ */
+export function makeOrcaEdge(
+  whirlpool: string,
+  mintA: string,
+  mintB: string,
+  ctx: WhirlpoolContext,
+): PoolEdge {
   const poolPk = new PublicKey(whirlpool);
   const client = buildWhirlpoolClient(ctx);
 
-  function direction(from: string, to: string) {
-    if (from === mintA && to === mintB) return { aToB: true };
-    if (from === mintB && to === mintA) return { aToB: false };
-    throw new Error(`orca direction mismatch ${from} -> ${to}`);
+  function getInputMint(from: string): PublicKey {
+    if (from === mintA) return new PublicKey(mintA);
+    if (from === mintB) return new PublicKey(mintB);
+    throw new Error(`orca: direction mismatch: from=${from} not in [${mintA}, ${mintB}]`);
   }
 
   return {
@@ -23,44 +36,44 @@ export function makeOrcaEdge(whirlpool: string, mintA: string, mintB: string, ct
 
     async quoteOut(amountIn: bigint): Promise<bigint> {
       const pool = await client.getPool(poolPk);
-      const aToB = direction(this.from, this.to).aToB;
+      const inputMint = getInputMint(this.from);
+      const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
 
-      // Prefer cached pool account freshness (subscription happens in builder)
-      // Quote in base units using Decimal
-      const q = await swapQuoteByInputToken(
+      const quote = await swapQuoteByInputToken(
         pool,
-        aToB,
+        inputMint,
         new Decimal(amountIn.toString()),
-        CFG.maxSlippageBps,
+        slippage,
         ctx.program.programId,
         ctx.fetcher,
         true
       );
 
-      return BigInt(q.estimatedAmountOut.toFixed(0));
+      return BigInt(quote.estimatedAmountOut.toFixed(0));
     },
 
     async buildSwapIx(amountIn: bigint, _minOut: bigint, _user: PublicKey): Promise<TransactionInstruction[]> {
       const pool = await client.getPool(poolPk);
-      const aToB = direction(this.from, this.to).aToB;
+      const inputMint = getInputMint(this.from);
+      const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
 
-      const q = await swapQuoteByInputToken(
+      const quote = await swapQuoteByInputToken(
         pool,
-        aToB,
+        inputMint,
         new Decimal(amountIn.toString()),
-        CFG.maxSlippageBps,
+        slippage,
         ctx.program.programId,
         ctx.fetcher,
         true
       );
 
-      const txb = pool.swapIx(q);
-      const cuIx = increaseComputeBudgetIx(1_000_000);
-      return [cuIx, ...txb.compressIx(false).instructions];
+      const tb = await pool.swap(quote);
+      return tb.compressIx(false).instructions;
     }
   };
 }
 
+/** Build an Orca Whirlpool context (dummy wallet is fine for read-only). */
 export function initOrcaCtx(conn: any, walletPk: PublicKey) {
   const dummyWallet = { publicKey: walletPk } as any;
   return WhirlpoolContext.from(conn, dummyWallet, ORCA_WHIRLPOOL_PROGRAM_ID);
