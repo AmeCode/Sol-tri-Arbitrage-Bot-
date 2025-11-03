@@ -1,3 +1,4 @@
+// src/dex/raydiumClmmAdapter.ts
 import {
   PublicKey,
   TransactionInstruction,
@@ -11,15 +12,23 @@ import {
   PoolInfoLayout,
   PoolUtils,
   type ApiV3PoolInfoConcentratedItem,
+  Clmm, // note: we’ll feature-detect method names at runtime
 } from '@raydium-io/raydium-sdk-v2';
 import BN from 'bn.js';
-import Decimal from 'decimal.js-light';
+import DecimalJs from 'decimal.js';
+// Create a strongly-typed constructor alias so TS treats it as new-able
+type DecimalInstance = import('decimal.js').Decimal;
+const DecimalCtor: new (v?: number | string | bigint) => DecimalInstance =
+  DecimalJs as unknown as new (v?: number | string | bigint) => DecimalInstance;
+
+const priceLimit0 = new DecimalCtor(0);
 import { PoolEdge } from '../graph/types.js';
 import { CFG } from '../config.js';
 
 /**
- * Build a Raydium CLMM edge that quotes via PoolUtils.computeAmountOut ONLY.
- * Execution (buildSwapIx) uses makeSwapInstructionSimple.
+ * Raydium CLMM edge:
+ *  - Quote: PoolUtils.computeAmountOut (tick-array aware, no HTTP)
+ *  - Execute: Clmm.makeSwapInstruction (or Legacy fallback)
  */
 export function makeRayClmmEdge(
   poolId: string,
@@ -28,8 +37,6 @@ export function makeRayClmmEdge(
   connection: Connection
 ): PoolEdge {
   const pid = new PublicKey(poolId);
-
-  // REST client for Raydium metadata (programId, token info, config, price, …)
   const api = new Api({ cluster: 'mainnet', timeout: 12_000 });
 
   function direction(from: string, to: string) {
@@ -38,7 +45,6 @@ export function makeRayClmmEdge(
     throw new Error(`raydium direction mismatch ${from} -> ${to}`);
   }
 
-  /** Raw on-chain pool account (for fast validation / optional use). */
   type DecodedClmmPool = ReturnType<typeof PoolInfoLayout.decode> & { poolId: PublicKey };
   async function fetchPoolAccount(): Promise<DecodedClmmPool> {
     const acc = (await connection.getAccountInfo(pid)) as AccountInfo<Buffer> | null;
@@ -47,29 +53,16 @@ export function makeRayClmmEdge(
     return { poolId: pid, ...state };
   }
 
-  /**
-   * Pull the full ApiV3 pool record we need to build a ComputeClmmPoolInfo
-   * (mintA/mintB objects, config, price, programId).
-   */
   async function fetchApiPool(): Promise<ApiV3PoolInfoConcentratedItem> {
     const res = await api.fetchPoolById({ ids: poolId });
     const item = res.find((p) => p.id === poolId);
     if (!item) throw new Error(`raydium: api pool not found for ${poolId}`);
-    if (item.type !== 'Concentrated') {
-      throw new Error(`raydium: pool ${poolId} is not a CLMM pool`);
-    }
+    if (item.type !== 'Concentrated') throw new Error(`raydium: pool ${poolId} is not CLMM`);
     return item as ApiV3PoolInfoConcentratedItem;
   }
 
-  /**
-   * Build the ComputeClmmPoolInfo + tickArrayCache the compute path requires.
-   * - ComputeClmmPoolInfo via PoolUtils.fetchComputeClmmInfo
-   * - tick arrays via PoolUtils.fetchMultiplePoolTickArrays
-   */
   async function buildComputeInputs() {
     const apiPool = await fetchApiPool();
-
-    // Optionally pass decoded RPC bytes to avoid a 2nd fetch inside PoolUtils
     const rpcAcc = (await connection.getAccountInfo(pid)) as AccountInfo<Buffer> | null;
     const rpcData = rpcAcc ? PoolInfoLayout.decode(rpcAcc.data) : undefined;
 
@@ -92,9 +85,7 @@ export function makeRayClmmEdge(
       batchRequest: true,
     });
 
-    // computeAmountOut wants tickArrayCache for THIS pool only
     const tickArrayCache = tickArraysByPool[computePool.id.toBase58()] ?? {};
-
     return { computePool, tickArrayCache };
   }
 
@@ -104,59 +95,68 @@ export function makeRayClmmEdge(
     to: mintB,
     feeBps: 0,
 
-    /** Quote strictly via PoolUtils.computeAmountOut. */
+    /** Pure local quote using PoolUtils.computeAmountOut */
     async quoteOut(amountIn: bigint): Promise<bigint> {
-      // Ensure pool exists (fast fail if not)
-      await fetchPoolAccount();
+      await fetchPoolAccount(); // fast existence check
 
       const { computePool, tickArrayCache } = await buildComputeInputs();
       const epochInfo: EpochInfo = await connection.getEpochInfo();
 
-      const baseMint = new PublicKey(this.from); // input side
-      const amountInBN = new BN(amountIn.toString());
-      const slippage = CFG.maxSlippageBps / 10_000; // computeAmountOut expects fraction (e.g. 0.002)
-      const priceLimit = new Decimal(0); // let SDK choose min/max depending on side
-
       const out = PoolUtils.computeAmountOut({
         poolInfo: computePool,
         tickArrayCache,
-        baseMint,
+        baseMint: new PublicKey(this.from),
         epochInfo,
-        amountIn: amountInBN,
-        slippage,
-        priceLimit,
+        amountIn: new BN(amountIn.toString()),
+        slippage: CFG.maxSlippageBps / 10_000, // expects ratio
+        priceLimit: priceLimit0,
         catchLiquidityInsufficient: true,
       });
 
-      // Return raw base units (BN -> bigint)
       return BigInt(out.amountOut.amount.toString());
     },
 
-    /** Build swap instructions (unchanged): use Raydium builder for execution. */
+    /** Build CLMM swap ix; SDK v0.2.30-alpha exposes `makeSwapInstruction` (not Simple). */
     async buildSwapIx(
       amountIn: bigint,
       _minOut: bigint,
       user: PublicKey
     ): Promise<TransactionInstruction[]> {
-      // We still need the "poolKeys-like" struct; the builder accepts ComputeClmmPoolInfo.
       const { computePool } = await buildComputeInputs();
       const slippage = new Percent(CFG.maxSlippageBps, 10_000);
       const { aToB } = direction(this.from, this.to);
 
-      // In recent SDK cuts makeSwapInstructionSimple accepts `poolInfo: ComputeClmmPoolInfo`
-      const res: any = await (PoolUtils as any).constructor // just to satisfy TS if types drift
-      ; // no-op to keep TS quiet in some editors
+      const clmmAny = Clmm as unknown as Record<string, any>;
 
-      const swapRes = await (await import('@raydium-io/raydium-sdk-v2')).Clmm.makeSwapInstructionSimple({
-        connection,
-        poolInfo: computePool,
-        ownerInfo: { useSOLBalance: true, wallet: user },
-        inputMint: new PublicKey(this.from),
-        inputAmount: amountIn,
-        slippage,
-        aToB,
-        makeTxVersion: 0,
-      });
+      let swapRes: { innerTransactions?: { instructions?: TransactionInstruction[] }[] };
+
+      if (typeof clmmAny.makeSwapInstruction === 'function') {
+        // Current in 0.2.30-alpha
+        swapRes = await clmmAny.makeSwapInstruction({
+          connection,
+          poolInfo: computePool,
+          ownerInfo: { useSOLBalance: true, wallet: user },
+          inputMint: new PublicKey(this.from),
+          inputAmount: new BN(amountIn.toString()),
+          slippage,
+          aToB,
+          makeTxVersion: 0,
+        });
+      } else if (typeof clmmAny.makeSwapInstructionLegacy === 'function') {
+        // Older prereleases
+        swapRes = await clmmAny.makeSwapInstructionLegacy({
+          connection,
+          poolInfo: computePool,
+          ownerInfo: { useSOLBalance: true, wallet: user },
+          inputMint: new PublicKey(this.from),
+          inputAmount: new BN(amountIn.toString()),
+          slippage,
+          aToB,
+          makeTxVersion: 0,
+        });
+      } else {
+        throw new Error('raydium: no CLMM swap builder found in this SDK build');
+      }
 
       const ixs: TransactionInstruction[] = [];
       for (const itx of swapRes.innerTransactions ?? []) {
@@ -166,3 +166,4 @@ export function makeRayClmmEdge(
     },
   };
 }
+
