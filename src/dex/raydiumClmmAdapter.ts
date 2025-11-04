@@ -11,7 +11,6 @@ import {
   Percent,
   PoolInfoLayout,
   PoolUtils,
-  type ApiV3PoolInfoConcentratedItem,
   Clmm, // note: we’ll feature-detect method names at runtime
 } from '@raydium-io/raydium-sdk-v2';
 import BN from 'bn.js';
@@ -53,12 +52,34 @@ export function makeRayClmmEdge(
     return { poolId: pid, ...state };
   }
 
-  async function fetchApiPool(): Promise<ApiV3PoolInfoConcentratedItem> {
-    const res = await api.fetchPoolById({ ids: poolId });
-    const item = res.find((p) => p.id === poolId);
+  type ApiConcentratedPool = {
+    id: string;
+    programId: string;
+    mintA: string;
+    mintB: string;
+    config: unknown;
+    price: unknown;
+    type: 'Concentrated';
+    [key: string]: unknown;
+  };
+
+  function isConcentratedPool(value: unknown): value is ApiConcentratedPool {
+    if (!value || typeof value !== 'object') return false;
+    const pool = value as Partial<ApiConcentratedPool>;
+    return (
+      pool.type === 'Concentrated' &&
+      typeof pool.id === 'string' &&
+      typeof pool.programId === 'string' &&
+      typeof pool.mintA === 'string' &&
+      typeof pool.mintB === 'string'
+    );
+  }
+
+  async function fetchApiPool(): Promise<ApiConcentratedPool> {
+    const res = (await api.fetchPoolById({ ids: poolId })) as unknown[];
+    const item = res.find((p: unknown): p is ApiConcentratedPool => isConcentratedPool(p) && p.id === poolId);
     if (!item) throw new Error(`raydium: api pool not found for ${poolId}`);
-    if (item.type !== 'Concentrated') throw new Error(`raydium: pool ${poolId} is not CLMM`);
-    return item as ApiV3PoolInfoConcentratedItem;
+    return item;
   }
 
   async function buildComputeInputs() {

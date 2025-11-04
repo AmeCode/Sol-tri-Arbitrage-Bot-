@@ -29,13 +29,21 @@ export function makeRayClmmEdge(poolId, mintA, mintB, connection) {
         const state = PoolInfoLayout.decode(acc.data);
         return { poolId: pid, ...state };
     }
+    function isConcentratedPool(value) {
+        if (!value || typeof value !== 'object')
+            return false;
+        const pool = value;
+        return (pool.type === 'Concentrated' &&
+            typeof pool.id === 'string' &&
+            typeof pool.programId === 'string' &&
+            typeof pool.mintA === 'string' &&
+            typeof pool.mintB === 'string');
+    }
     async function fetchApiPool() {
-        const res = await api.fetchPoolById({ ids: poolId });
-        const item = res.find((p) => p.id === poolId);
+        const res = (await api.fetchPoolById({ ids: poolId }));
+        const item = res.find((p) => isConcentratedPool(p) && p.id === poolId);
         if (!item)
             throw new Error(`raydium: api pool not found for ${poolId}`);
-        if (item.type !== 'Concentrated')
-            throw new Error(`raydium: pool ${poolId} is not CLMM`);
         return item;
     }
     async function buildComputeInputs() {
