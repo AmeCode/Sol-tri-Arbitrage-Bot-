@@ -1,5 +1,4 @@
-#!/bin/bash
-docker builder prune -af
-docker compose build --no-cache
-docker compose up -d
+docker compose down --rmi all --volumes --remove-orphans
+docker system prune -af --volumes
+docker compose up -d --build
 docker logs -f tri_arb

@@ -4,15 +4,13 @@ import {
   ORCA_WHIRLPOOL_PROGRAM_ID,
   buildWhirlpoolClient,
   swapQuoteByInputToken,
+  UseFallbackTickArray,
 } from '@orca-so/whirlpools-sdk';
-import Decimal from 'decimal.js-light';
 import { Percentage } from '@orca-so/common-sdk';
+import BN from 'bn.js';
 import { PoolEdge } from '../graph/types.js';
 import { CFG } from '../config.js';
 
-/**
- * Create an Orca Whirlpool PoolEdge (both directions are created by builder.ts).
- */
 export function makeOrcaEdge(
   whirlpool: string,
   mintA: string,
@@ -42,14 +40,14 @@ export function makeOrcaEdge(
       const quote = await swapQuoteByInputToken(
         pool,
         inputMint,
-        new Decimal(amountIn.toString()),
+        new BN(amountIn.toString()),          // BN, not Decimal
         slippage,
         ctx.program.programId,
         ctx.fetcher,
-        true
+        { maxAge: 0 },                        // <-- VALID SimpleAccountFetchOptions
+        UseFallbackTickArray.Never            // (or .Auto / .Always)
       );
-
-      return BigInt(quote.estimatedAmountOut.toFixed(0));
+      return BigInt(quote.estimatedAmountOut.toString());
     },
 
     async buildSwapIx(amountIn: bigint, _minOut: bigint, _user: PublicKey): Promise<TransactionInstruction[]> {
@@ -60,11 +58,12 @@ export function makeOrcaEdge(
       const quote = await swapQuoteByInputToken(
         pool,
         inputMint,
-        new Decimal(amountIn.toString()),
+        new BN(amountIn.toString()),
         slippage,
         ctx.program.programId,
         ctx.fetcher,
-        true
+        { maxAge: 0 },                        // <-- remove `refresh`
+        UseFallbackTickArray.Never
       );
 
       const tb = await pool.swap(quote);
@@ -73,7 +72,6 @@ export function makeOrcaEdge(
   };
 }
 
-/** Build an Orca Whirlpool context (dummy wallet is fine for read-only). */
 export function initOrcaCtx(conn: any, walletPk: PublicKey) {
   const dummyWallet = { publicKey: walletPk } as any;
   return WhirlpoolContext.from(conn, dummyWallet, ORCA_WHIRLPOOL_PROGRAM_ID);
