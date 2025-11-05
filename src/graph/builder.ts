@@ -8,7 +8,8 @@ import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
 import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
 import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
 import { canonicalMint, WSOL_MINT } from '../util/mints.js';
-import { loadRayIndexOnce } from '../initRay.js';
+import { loadRayIndexOnce, rayIndex } from '../initRay.js';
+import { isTradable } from '../ray/clmmIndex.js';
 
 console.log('[cfg] pools.orca', CFG.pools.orca);
 console.log('[cfg] pools.ray', CFG.pools.ray);
@@ -64,13 +65,33 @@ export async function buildEdges(): Promise<PoolEdge[]> {
 
   // ---- Raydium CLMM ----
   const rayPools = CFG.pools.ray;
-
+  const filteredRayPools: typeof rayPools = [];
   for (const p of rayPools) {
+    const id = new PublicKey(p.id).toBase58();
+    const apiPool = rayIndex.getById(id) ?? await rayIndex.fetchByIdAndCache(id);
+    if (!apiPool) {
+      console.warn('[boot] Ray pool not found in API (will auto-recover by mints at runtime)', { id });
+      filteredRayPools.push(p);
+      continue;
+    }
+    if (!isTradable(apiPool)) {
+      console.warn('[boot] drop locked/untradable Ray pool', {
+        id,
+        status: apiPool.status || apiPool.state,
+        liq: apiPool.liquidity,
+        tvl: apiPool.tvlUsd ?? apiPool.tvl_usd ?? apiPool.tvl,
+      });
+      continue;
+    }
+    filteredRayPools.push(p);
+  }
+
+  for (const p of filteredRayPools) {
     const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
     const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
-      { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: fromMint, to: toMint },
-      { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: toMint, to: fromMint }
+      { ...makeRayClmmEdge(p.id, fromMint, toMint), from: fromMint, to: toMint },
+      { ...makeRayClmmEdge(p.id, fromMint, toMint), from: toMint, to: fromMint }
     );
   }
 
@@ -94,7 +115,7 @@ export async function buildEdges(): Promise<PoolEdge[]> {
 
   const samplePairs = [...byPair.entries()].slice(0, 10);
 
-  console.log(`[builder] orca=${orcaPools.length}, ray=${rayPools.length}, meteora=${dlmms.length} pools; edges=${edges.length}`);
+  console.log(`[builder] orca=${orcaPools.length}, ray=${filteredRayPools.length}, meteora=${dlmms.length} pools; edges=${edges.length}`);
   console.log('[builder] directed edges per pair sample=', samplePairs);
   return edges;
 }
