@@ -1,18 +1,43 @@
 import { CFG } from './config.js';
-import { makeConnections, getFreshBlockhash } from './rpc.js';
+import { makeConnections } from './rpc.js';
 import { buildEdges } from './graph/builder.js';
 import { findTriCandidates } from './graph/findTri.js';
 import { bestSize } from './sizing.js';
 import { startMetrics, cBundlesOk, cBundlesSent, cSimFail, cExecFail, gIncludeRatio, gPriorityFee, cScansTotal } from './metrics.js';
-import { Keypair, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, PublicKey } from '@solana/web3.js';
+import { Keypair, PublicKey, Connection, sendAndConfirmTransaction, TransactionInstruction, VersionedTransaction, Transaction } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { searcherClient } from 'jito-ts/dist/sdk/block-engine/searcher.js';
+import { ensureLutHas } from './lut.js';
+import { buildAndMaybeLut, getRuntimeLutAddress, setRuntimeLutAddress } from './tx.js';
 
-async function getFreshHashSafe(read: any, send: any) {
-  try { return await send.getLatestBlockhash('processed'); }
-  catch (e) {
-    console.warn('[blockhash] SEND RPC failed, fallback to READ:', (e as any)?.message ?? e);
-    return await read.getLatestBlockhash('processed');
+function allowedByHopCount(pathLen: number, lutExists: boolean) {
+  if (pathLen <= CFG.maxHops) return true;
+  if (pathLen === 3 && CFG.allowThirdHop && lutExists) return true;
+  return false;
+}
+
+async function primeLutFromRegistry(connection: Connection, wallet: Keypair) {
+  const pools = [...CFG.pools.orca, ...CFG.pools.ray, ...CFG.pools.meteora];
+  const seen = new Set<string>();
+  const keys: PublicKey[] = [];
+  for (const pool of pools) {
+    try {
+      const pk = new PublicKey(pool.id);
+      const base58 = pk.toBase58();
+      if (!seen.has(base58)) {
+        seen.add(base58);
+        keys.push(pk);
+      }
+    } catch (e) {
+      console.warn('[lut] skip invalid pool id', pool.id, (e as Error)?.message ?? e);
+    }
+  }
+  if (keys.length === 0) return;
+  try {
+    const ensured = await ensureLutHas(connection, wallet.publicKey, wallet, getRuntimeLutAddress(), keys);
+    setRuntimeLutAddress(ensured);
+    console.log('[lut] primed from registry', ensured.toBase58(), 'keys', keys.length);
+  } catch (e) {
+    console.error('[lut] prime failed', (e as Error)?.message ?? e);
   }
 }
 
@@ -33,10 +58,7 @@ async function main() {
   const edges = await buildEdges();
   console.log(`[init] edges=${edges.length}, tokens=${CFG.tokensUniverse.length}`);
 
-  // Jito BE client (public mode; no auth key)
-  const jito = searcherClient(CFG.jitoUrl as any, undefined as any);
-  const tipList: any = await jito.getTipAccounts().catch(() => ([]));
-  const tipAccount = tipList?.[0] ? new PublicKey(tipList[0]) : null;
+  await primeLutFromRegistry(sendConn, wallet);
 
   let priorityFee = CFG.priorityFeeMin;
   let sent = 0, ok = 0, consecutiveFails = 0;
@@ -51,16 +73,6 @@ async function main() {
     gPriorityFee.set(priorityFee);
   }
 
-  async function sendViaBundle(vtx: VersionedTransaction) {
-    // Simple bundle with a single tx; you can add a separate “tip tx” later
-    const { Bundle } = await import('jito-ts/dist/sdk/block-engine/types.js');
-    const { isError } = await import('jito-ts/dist/sdk/block-engine/utils.js');
-    const b = new Bundle([], 3);
-    const res = (b as any).addSignedTransactions(vtx);
-    if (isError(res)) throw res;
-    return jito.sendBundle(b);
-  }
-
   while (true) {
     try {
       console.log(`[loop] tick ${new Date().toISOString()}`);
@@ -70,82 +82,97 @@ async function main() {
       const seed = CFG.sizeLadder[0]; // seed for candidate scan
       console.log(`[scan] building candidates with seed=${seed}`);
       const candidates = await findTriCandidates(edges, seed);
-      console.log(`[scan] candidates=${candidates.length}`);
+      const lutExists = getRuntimeLutAddress() !== null;
+      const filteredCandidates = candidates.filter(path => allowedByHopCount(path.length, lutExists));
+      console.log(`[scan] candidates=${candidates.length}, filtered=${filteredCandidates.length}`);
 
-      for (const path of candidates) {
+      for (const path of filteredCandidates) {
         const sized = await bestSize(path, CFG.sizeLadder);
         if (!sized) continue;
 
         const routeId = path.map(e => e.id).join(' -> ');
         console.log(`[scan] evaluating route ${routeId}`);
 
-        let q1: bigint;
-        try {
-          console.log(`[quote] via ${path[0].id} amountIn=${sized.inAmount}`);
-          q1 = await path[0].quoteOut(sized.inAmount);
-          if (q1 <= 0n) {
-            console.warn(`[quote] ${path[0].id} returned ${q1} for ${sized.inAmount}`);
-            continue;
+        const hopQuotes: bigint[] = [];
+        let currentAmount = sized.inAmount;
+        let quotesOk = true;
+        for (let i = 0; i < path.length; i++) {
+          const edge = path[i];
+          try {
+            console.log(`[quote] via ${edge.id} amountIn=${currentAmount}`);
+            const out = await edge.quoteOut(currentAmount);
+            if (out <= 0n) {
+              console.warn(`[quote] ${edge.id} returned ${out} for ${currentAmount}`);
+              quotesOk = false;
+              break;
+            }
+            hopQuotes.push(out);
+            currentAmount = out;
+          } catch (e) {
+            console.warn(`[quote] ${edge.id} failed:`, (e as Error)?.message ?? e);
+            quotesOk = false;
+            break;
           }
-        } catch (e) {
-          console.warn(`[quote] ${path[0].id} failed:`, (e as Error)?.message ?? e);
-          continue;
         }
+        if (!quotesOk || hopQuotes.length === 0) continue;
 
-        let q2: bigint;
-        try {
-          console.log(`[quote] via ${path[1].id} amountIn=${q1}`);
-          q2 = await path[1].quoteOut(q1);
-          if (q2 <= 0n) {
-            console.warn(`[quote] ${path[1].id} returned ${q2} for ${q1}`);
-            continue;
-          }
-        } catch (e) {
-          console.warn(`[quote] ${path[1].id} failed:`, (e as Error)?.message ?? e);
-          continue;
-        }
-
-        let q3: bigint;
-        try {
-          console.log(`[quote] via ${path[2].id} amountIn=${q2}`);
-          q3 = await path[2].quoteOut(q2);
-          if (q3 <= 0n) {
-            console.warn(`[quote] ${path[2].id} returned ${q3} for ${q2}`);
-            continue;
-          }
-        } catch (e) {
-          console.warn(`[quote] ${path[2].id} failed:`, (e as Error)?.message ?? e);
-          continue;
-        }
-
-        const pnl = q3 - sized.inAmount;
+        const finalOut = hopQuotes[hopQuotes.length - 1];
+        const pnl = finalOut - sized.inAmount;
         const pnlBps = sized.inAmount > 0n ? Number((pnl * 10_000n) / sized.inAmount) : 0;
-        console.log(`[sim] route=${routeId} expectedOut=${q3} pnlBps=${pnlBps}`);
+        console.log(`[sim] route=${routeId} expectedOut=${finalOut} pnlBps=${pnlBps}`);
 
-        if (q3 <= sized.inAmount) continue;
+        if (finalOut <= sized.inAmount) continue;
 
         console.log('[send] building tx...');
-        const ix1 = await path[0].buildSwapIx(sized.inAmount, q1, wallet.publicKey);
-        const ix2 = await path[1].buildSwapIx(q1, q2, wallet.publicKey);
-        const ix3 = await path[2].buildSwapIx(q2, q3, wallet.publicKey);
+        const swapIxs: TransactionInstruction[] = [];
+        let amountIn = sized.inAmount;
+        for (let i = 0; i < path.length; i++) {
+          const edge = path[i];
+          const minOut = hopQuotes[i];
+          const ixSet = await edge.buildSwapIx(amountIn, minOut, wallet.publicKey);
+          swapIxs.push(...ixSet);
+          amountIn = minOut;
+        }
 
-        const cuIx = ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 });
-        const feeIx = ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee });
+        const { tx, lutAddressUsed } = await buildAndMaybeLut(
+          sendConn,
+          wallet.publicKey,
+          wallet,
+          swapIxs,
+          priorityFee,
+        );
 
-        const { blockhash, lastValidBlockHeight } = await getFreshHashSafe(readConn, sendConn);
-        const msg = new TransactionMessage({
-          payerKey: wallet.publicKey,
-          recentBlockhash: blockhash,
-          instructions: [cuIx, feeIx, ...ix1, ...ix2, ...ix3]
-        }).compileToV0Message();
-
-        const vtx = new VersionedTransaction(msg);
-        vtx.sign([wallet]);
+        if (lutAddressUsed) {
+          setRuntimeLutAddress(lutAddressUsed);
+          console.log('[lut] used', lutAddressUsed.toBase58());
+        }
 
         // Simulate exact tx
         console.log('[sim] simulating tx...');
-        const sim = await readConn.simulateTransaction(vtx, { sigVerify: false, replaceRecentBlockhash: false });
-        const simOk = !sim.value.err;
+        let simOk = true;
+        try {
+          if (tx instanceof VersionedTransaction) {
+            tx.sign([wallet]);
+            const sim = await readConn.simulateTransaction(tx, {
+              sigVerify: false,
+              replaceRecentBlockhash: false,
+            });
+            simOk = !sim.value.err;
+            if (!simOk) {
+              console.warn('[sim] err', sim.value.err);
+            }
+          } else {
+            const sim = await readConn.simulateTransaction(tx, [wallet]);
+            simOk = !sim.value.err;
+            if (!simOk) {
+              console.warn('[sim] err', sim.value.err);
+            }
+          }
+        } catch (e) {
+          console.warn('[sim] exception', (e as Error)?.message ?? e);
+          simOk = false;
+        }
+
         if (!simOk) {
           cSimFail.inc(); consecutiveFails++;
           if (CFG.haltOnNegativeSim) continue;
@@ -153,10 +180,21 @@ async function main() {
 
         try {
           cBundlesSent.inc(); sent++;
-          const id = await sendViaBundle(vtx);
-          console.log('[send] submitted bundle...', id ?? '(no id)');
-          if (id) { cBundlesOk.inc(); ok++; consecutiveFails = 0; }
-          else { cExecFail.inc(); consecutiveFails++; }
+          let sig: string;
+          if (tx instanceof VersionedTransaction) {
+            sig = await (sendAndConfirmTransaction as any)(sendConn, tx, {
+              skipPreflight: false,
+              commitment: 'confirmed',
+            });
+          } else {
+            tx.sign(wallet);
+            sig = await sendAndConfirmTransaction(sendConn, tx, [wallet], {
+              skipPreflight: false,
+              commitment: 'confirmed',
+            });
+          }
+          console.log('[send] sig', sig);
+          cBundlesOk.inc(); ok++; consecutiveFails = 0;
         } catch (e) {
           console.error('[bundle/send] error', e);
           cExecFail.inc(); consecutiveFails++;

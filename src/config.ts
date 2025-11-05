@@ -70,6 +70,10 @@ export const CFG = {
   },
 
   maxSlippageBps: 20,
+  maxHops: Number(process.env.MAX_HOPS ?? 2),
+  allowThirdHop: String(process.env.ALLOW_THIRD_HOP ?? 'true') === 'true',
+  cuLimit: Number(process.env.CU_LIMIT ?? 1_400_000),
+  lutAddressEnv: process.env.LUT_ADDRESS ?? '',
 };
 
 // Optional: one-time sanity logs
