@@ -17,6 +17,7 @@ export const CFG = {
     priorityFeeMax: Number(process.env.PRIORITY_FEE_MAX ?? 40000),
     feeAdjStep: Number(process.env.FEE_ADJ_STEP ?? 1000),
     includeRatioTarget: Number(process.env.INCLUDE_RATIO_TARGET ?? 0.3),
+    scanIntervalMs: Number(process.env.SCAN_INTERVAL_MS ?? 2000),
     cooldownMs: Number(process.env.COOLDOWN_MS ?? 350),
     maxConsecutiveFails: Number(process.env.MAX_CONSECUTIVE_FAILS ?? 5),
     haltOnNegativeSim: String(process.env.HALT_ON_NEGATIVE_SIM ?? 'false') === 'true',
