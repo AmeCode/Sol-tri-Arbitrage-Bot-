@@ -1,51 +1,33 @@
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
-import type { Connection } from "@solana/web3.js";
 import BN from "bn.js";
 import { Clmm, PoolUtils } from "@raydium-io/raydium-sdk-v2";
 import { PoolEdge } from "../graph/types.js";
 import { bigIntToBN } from "../amounts.js";
 import { CFG } from "../config.js";
 
-type RawApiPool = {
-  id: string;
-  programId: string;
-  type?: string;
-  price?: number;
-  mintA?: { address: string; [key: string]: unknown };
-  mintB?: { address: string; [key: string]: unknown };
-  config?: { id: string; [key: string]: unknown };
-  [key: string]: unknown;
-};
-
-type ClmmApiPool = RawApiPool & {
-  type: "Concentrated";
-  price: number;
-  mintA: { address: string; [key: string]: unknown };
-  mintB: { address: string; [key: string]: unknown };
-  config: { id: string; [key: string]: unknown };
-};
-
-function isClmmPool(pool: RawApiPool | undefined): pool is ClmmApiPool {
-  return (
-    !!pool &&
-    pool.type === "Concentrated" &&
-    typeof pool.price === "number" &&
-    !!pool.mintA?.address &&
-    !!pool.mintB?.address &&
-    !!pool.config?.id
-  );
-}
-
 /**
  * You must have an SDK wrapper that exposes:
  * - raydium.connection  (web3.js Connection)
  * - raydium.wallet      (payer or dummy readonly)
- * - raydium.api         (Raydium Api instance)
+ * - raydium.api         (RaydiumApiV3)
  * Create it once and pass in via makeRaydiumClmmEdge(..., raydium)
  */
+type ApiPoolMinimal = {
+  id: string;
+  programId: string;
+  mintA: { address: string; [key: string]: unknown };
+  mintB: { address: string; [key: string]: unknown };
+  config: unknown;
+  price: number;
+  [key: string]: unknown;
+};
+
 export type RaydiumCtx = {
-  api: { fetchPoolById: (props: { ids: string }) => Promise<RawApiPool[]> };
-  connection: Connection;
+  api: {
+    /** Pool metadata / JSON through Raydium API proxy in SDK v2 */
+    fetchPoolById: (ids: string | string[]) => Promise<ApiPoolMinimal[]>;
+  };
+  connection: import("@solana/web3.js").Connection;
   wallet: { publicKey: PublicKey };
 };
 
@@ -62,27 +44,24 @@ export function makeRaydiumClmmEdge(
   }
 
   async function loadPoolData() {
-    const [poolInfo] = await raydium.api.fetchPoolById({ ids: poolId });
-    if (!isClmmPool(poolInfo)) {
-      console.warn(`[raydium] pool ${poolId} missing or not concentrated`);
-      return null;
-    }
+    const [apiPool] = await raydium.api.fetchPoolById(poolId);
+    if (!apiPool) return null;
 
     const clmmInfo = await PoolUtils.fetchComputeClmmInfo({
       connection: raydium.connection,
-      poolInfo: poolInfo as any,
+      poolInfo: apiPool
     });
 
     const { ammConfig: _ammConfig, ...poolState } = clmmInfo;
     const tickArrayMap = await PoolUtils.fetchMultiplePoolTickArrays({
       connection: raydium.connection,
       poolKeys: [poolState],
-      batchRequest: true,
+      batchRequest: true
     });
 
     const tickArrayCache = tickArrayMap[clmmInfo.id.toBase58()] ?? {};
 
-    return { apiPool: poolInfo, clmmInfo, tickArrayCache };
+    return { apiPool, clmmInfo, tickArrayCache };
   }
 
   return {
@@ -101,14 +80,17 @@ export function makeRaydiumClmmEdge(
         }
         const { apiPool, clmmInfo, tickArrayCache } = poolData;
 
+        // 3) Direction: input mint
         const inputMint = getInputMint(this.from);
 
+        // 4) Amount as BN with correct decimals (from API pool mints)
         const inMintStr = inputMint.toBase58();
         const inBn = bigIntToBN(amountIn);
         const baseIn = inMintStr === apiPool.mintA.address;
         const tokenOut = baseIn ? apiPool.mintB : apiPool.mintA;
         const epochInfo = await raydium.connection.getEpochInfo();
 
+        // 5) Compute amountOut using SDK formatter
         const compute = PoolUtils.computeAmountOutFormat({
           poolInfo: clmmInfo,
           tickArrayCache,
@@ -116,7 +98,7 @@ export function makeRaydiumClmmEdge(
           tokenOut,
           slippage: CFG.maxSlippageBps / 10_000,
           epochInfo,
-          catchLiquidityInsufficient: true,
+          catchLiquidityInsufficient: true
         });
 
         const outAmount = compute.amountOut?.amount.raw;
@@ -147,7 +129,7 @@ export function makeRaydiumClmmEdge(
           poolInfo: clmmInfo,
           ownerInfo: {
             wallet: user,
-            tokenAccounts: [], // fill with user's SPL accounts if you assemble full tx here
+            tokenAccounts: [] // fill with user's SPL accounts if you assemble full tx here
           },
           inputMint,
           amountIn: bigIntToBN(amountIn),
@@ -160,6 +142,6 @@ export function makeRaydiumClmmEdge(
         console.warn(`[raydium] buildSwapIx error ${poolId}:`, (e as Error).message);
         return [];
       }
-    },
+    }
   };
 }
