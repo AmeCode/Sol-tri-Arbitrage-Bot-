@@ -5,9 +5,10 @@ import { makeConnections } from '../rpc.js';
 // Use the util/wsCache file instead of a non-existent utils directory.
 import { WsAccountCache } from '../util/wsCache.js';
 import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
-import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
+import { makeRaydiumClmmEdge } from '../dex/raydiumClmmAdapter.js';
 import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
 import { canonicalMint, WSOL_MINT } from '../util/mints.js';
+import { initRaydiumCtx } from '../raydiumCtx.js';
 
 console.log('[cfg] pools.orca', CFG.pools.orca);
 console.log('[cfg] pools.ray', CFG.pools.ray);
@@ -42,6 +43,7 @@ export async function buildEdges(): Promise<PoolEdge[]> {
   // Wallet pubkey is only needed by Orca SDK context (dummy signer ok)
   const dummyWallet = new PublicKey(WSOL_MINT); // any 32B pk works; real payer signs in index.ts
   const orcaCtx = initOrcaCtx(read, dummyWallet);
+  const raydiumCtx = await initRaydiumCtx(CFG.rpcRead);
 
   const edges: PoolEdge[] = [];
 
@@ -66,8 +68,8 @@ export async function buildEdges(): Promise<PoolEdge[]> {
     const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
     const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
-      { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: fromMint, to: toMint },
-      { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: toMint, to: fromMint }
+      { ...makeRaydiumClmmEdge(p.id, fromMint, toMint, raydiumCtx), from: fromMint, to: toMint },
+      { ...makeRaydiumClmmEdge(p.id, fromMint, toMint, raydiumCtx), from: toMint, to: fromMint }
     );
   }
 

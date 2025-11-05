@@ -58,9 +58,10 @@ export const CFG = {
   maxConsecutiveFails: Number(process.env.MAX_CONSECUTIVE_FAILS ?? 5),
   haltOnNegativeSim: String(process.env.HALT_ON_NEGATIVE_SIM ?? 'false') === 'true',
 
-  sizeLadder: (process.env.SIZE_LADDER ?? '1000000,2000000,5000000')
+  sizeLadderHuman: (process.env.SIZE_LADDER_HUMAN ?? '0.5,1,2,5')
     .split(',')
-    .map(s => BigInt(s.trim())),
+    .map(s => s.trim())
+    .filter(Boolean),
 
   // Dynamically discovered pools from .env
   pools: {

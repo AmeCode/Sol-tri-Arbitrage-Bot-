@@ -1,7 +1,11 @@
 import { PoolEdge } from './types.js';
 import { canonicalMint, seedForMint } from '../util/mints.js';
+import type { makeSizeLadder } from '../amounts.js';
 
-export async function findTriCandidates(edges: PoolEdge[], defaultSeed: bigint): Promise<PoolEdge[][]> {
+type Ladder = ReturnType<typeof makeSizeLadder>;
+type LadderLookup = (edge: PoolEdge) => Ladder | undefined;
+
+export async function findTriCandidates(edges: PoolEdge[], ladderForEdge: LadderLookup): Promise<PoolEdge[][]> {
   type CanonEdge = { edge: PoolEdge; from: string; to: string };
   const canonEdges: CanonEdge[] = edges.map(edge => ({
     edge,
@@ -55,7 +59,8 @@ export async function findTriCandidates(edges: PoolEdge[], defaultSeed: bigint):
 
       rawTriangles++;
 
-      const startSeed = seedForMint(a.from) || defaultSeed;
+      const ladder = ladderForEdge(a.edge);
+      const startSeed = ladder?.[0] ? BigInt(ladder[0].toString()) : seedForMint(a.from);
 
       let q1: bigint;
       try {
