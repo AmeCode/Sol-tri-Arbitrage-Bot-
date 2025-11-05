@@ -6,6 +6,7 @@ import { WsAccountCache } from '../util/wsCache.js';
 import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
 import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
 import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
+import { canonicalMint, WSOL_MINT } from '../util/mints.js';
 const MINTS = {
     SOL: 'So11111111111111111111111111111111111111112',
     USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
@@ -18,7 +19,7 @@ export async function buildEdges() {
     const { read } = makeConnections();
     const cache = new WsAccountCache(read);
     // Wallet pubkey is only needed by Orca SDK context (dummy signer ok)
-    const dummyWallet = new PublicKey(MINTS.SOL); // any 32B pk works; real payer signs in index.ts
+    const dummyWallet = new PublicKey(WSOL_MINT); // any 32B pk works; real payer signs in index.ts
     const orcaCtx = initOrcaCtx(read, dummyWallet);
     const edges = [];
     // ---- Orca Whirlpools (subscribe to pool accounts) ----
@@ -30,7 +31,9 @@ export async function buildEdges() {
     for (const p of orcaPools) {
         const poolPk = new PublicKey(p.id);
         cache.subscribe(poolPk);
-        edges.push({ ...makeOrcaEdge(p.id, p.a, p.b, orcaCtx), from: p.a, to: p.b }, { ...makeOrcaEdge(p.id, p.a, p.b, orcaCtx), from: p.b, to: p.a });
+        const fromMint = canonicalMint(p.a);
+        const toMint = canonicalMint(p.b);
+        edges.push({ ...makeOrcaEdge(p.id, fromMint, toMint, orcaCtx), from: fromMint, to: toMint }, { ...makeOrcaEdge(p.id, fromMint, toMint, orcaCtx), from: toMint, to: fromMint });
     }
     // ---- Raydium CLMM ----
     const rayPools = [
@@ -39,7 +42,9 @@ export async function buildEdges() {
         { id: CFG.pools.ray.jupUsdc, a: MINTS.JUP, b: MINTS.USDC }
     ].filter(p => p.id);
     for (const p of rayPools) {
-        edges.push({ ...makeRayClmmEdge(p.id, p.a, p.b, read), from: p.a, to: p.b }, { ...makeRayClmmEdge(p.id, p.a, p.b, read), from: p.b, to: p.a });
+        const fromMint = canonicalMint(p.a);
+        const toMint = canonicalMint(p.b);
+        edges.push({ ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: fromMint, to: toMint }, { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: toMint, to: fromMint });
     }
     // ---- Meteora DLMM (Micro-liquidity bins) ----
     const dlmms = [
@@ -48,9 +53,18 @@ export async function buildEdges() {
         { id: CFG.pools.meteora.jupUsdc, a: MINTS.JUP, b: MINTS.USDC }
     ].filter(p => p.id);
     for (const p of dlmms) {
-        edges.push({ ...makeMeteoraEdge(p.id, p.a, p.b), from: p.a, to: p.b }, { ...makeMeteoraEdge(p.id, p.b, p.a), from: p.b, to: p.a });
+        const fromMint = canonicalMint(p.a);
+        const toMint = canonicalMint(p.b);
+        edges.push({ ...makeMeteoraEdge(p.id, fromMint, toMint), from: fromMint, to: toMint }, { ...makeMeteoraEdge(p.id, toMint, fromMint), from: toMint, to: fromMint });
     }
+    const byPair = new Map();
+    for (const e of edges) {
+        const k = `${e.from}|${e.to}`;
+        byPair.set(k, (byPair.get(k) ?? 0) + 1);
+    }
+    const samplePairs = [...byPair.entries()].slice(0, 10);
     console.log(`[builder] orca=${orcaPools.length}, ray=${rayPools.length}, meteora=${dlmms.length} pools; edges=${edges.length}`);
+    console.log('[builder] directed edges per pair sample=', samplePairs);
     return edges;
 }
 //# sourceMappingURL=builder.js.map
