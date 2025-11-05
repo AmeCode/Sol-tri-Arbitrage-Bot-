@@ -49,11 +49,25 @@ export function makeRayClmmEdge(
   }
 
   async function fetchApiPool(): Promise<RayPoolInfo> {
-    const info = await poolRegistry.getById(poolId);
-    if (info) return info;
-    await poolRegistry.loadByIds([poolId]);
-    const refreshed = await poolRegistry.getById(poolId);
-    if (!refreshed) throw new Error(`raydium: api pool not found for ${poolId}`);
+    const id = poolId;
+    const cached = await poolRegistry.getById(id);
+    if (cached) return cached;
+
+    console.warn('[ray-edge] api pool cache miss', { poolId: id });
+
+    try {
+      await poolRegistry.loadByIds([id]);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      console.error('[ray-edge] api pool lookup failed', { poolId: id, error: message });
+      throw new Error(`raydium: api pool lookup failed for ${id}`);
+    }
+
+    const refreshed = await poolRegistry.getById(id);
+    if (!refreshed) {
+      console.warn('[ray-edge] api pool not found after refresh', { poolId: id });
+      throw new Error(`raydium: api pool not found for ${id}`);
+    }
     return refreshed;
   }
 
