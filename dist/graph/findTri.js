@@ -1,27 +1,100 @@
-export async function findTriCandidates(edges, seedInBase) {
-    // trivial triple-nested candidate builder; you can cache adjacency if you want
+import { canonicalMint, seedForMint } from '../util/mints.js';
+export async function findTriCandidates(edges, defaultSeed) {
+    const canonEdges = edges.map(edge => ({
+        edge,
+        from: canonicalMint(edge.from),
+        to: canonicalMint(edge.to),
+    }));
+    const tokens = new Set();
+    for (const ce of canonEdges) {
+        tokens.add(ce.from);
+        tokens.add(ce.to);
+    }
+    const dropCounts = {};
+    const logLimit = {};
+    function note(reason, detail) {
+        dropCounts[reason] = (dropCounts[reason] ?? 0) + 1;
+        const seen = (logLimit[reason] ?? 0) + 1;
+        logLimit[reason] = seen;
+        if (seen <= 5) {
+            console.log(`[scan] drop ${reason}: ${detail()}`);
+        }
+    }
     const out = [];
-    for (const a of edges)
-        for (const b of edges) {
-            if (a.to !== b.from)
+    let rawTriangles = 0;
+    for (const a of canonEdges)
+        for (const b of canonEdges) {
+            if (a.edge === b.edge) {
+                note('same_edge_ab', () => `${a.edge.id}`);
                 continue;
-            for (const c of edges) {
-                if (b.to !== c.from)
+            }
+            if (a.to !== b.from) {
+                note('mismatch_ab', () => `${a.edge.id} (${a.to}) -> ${b.edge.id} (${b.from})`);
+                continue;
+            }
+            for (const c of canonEdges) {
+                if (a.edge === c.edge || b.edge === c.edge) {
+                    note('same_edge_ca', () => `${a.edge.id}|${b.edge.id}|${c.edge.id}`);
                     continue;
-                if (c.to !== a.from)
+                }
+                if (b.to !== c.from) {
+                    note('mismatch_bc', () => `${b.edge.id} (${b.to}) -> ${c.edge.id} (${c.from})`);
                     continue;
-                // quick re-quote to gate out dead paths (fast path)
-                const q1 = await a.quoteOut(seedInBase);
-                if (q1 <= 0n)
+                }
+                if (c.to !== a.from) {
+                    note('mismatch_ca', () => `${c.edge.id} (${c.to}) -> ${a.edge.id} (${a.from})`);
                     continue;
-                const q2 = await b.quoteOut(q1);
-                if (q2 <= 0n)
+                }
+                rawTriangles++;
+                const startSeed = seedForMint(a.from) || defaultSeed;
+                let q1;
+                try {
+                    q1 = await a.edge.quoteOut(startSeed);
+                }
+                catch (e) {
+                    note('quote1_error', () => `${a.edge.id}: ${e?.message ?? e}`);
                     continue;
-                const q3 = await c.quoteOut(q2);
-                if (q3 > seedInBase)
-                    out.push([a, b, c]);
+                }
+                if (q1 <= 0n) {
+                    note('quote1_non_positive', () => `${a.edge.id} -> ${q1}`);
+                    continue;
+                }
+                let q2;
+                try {
+                    q2 = await b.edge.quoteOut(q1);
+                }
+                catch (e) {
+                    note('quote2_error', () => `${b.edge.id}: ${e?.message ?? e}`);
+                    continue;
+                }
+                if (q2 <= 0n) {
+                    note('quote2_non_positive', () => `${b.edge.id} -> ${q2}`);
+                    continue;
+                }
+                let q3;
+                try {
+                    q3 = await c.edge.quoteOut(q2);
+                }
+                catch (e) {
+                    note('quote3_error', () => `${c.edge.id}: ${e?.message ?? e}`);
+                    continue;
+                }
+                if (q3 <= 0n) {
+                    note('quote3_non_positive', () => `${c.edge.id} -> ${q3}`);
+                    continue;
+                }
+                if (q3 <= startSeed) {
+                    note('non_profitable', () => `${a.edge.id}|${b.edge.id}|${c.edge.id} -> ${q3} <= ${startSeed}`);
+                    continue;
+                }
+                out.push([a.edge, b.edge, c.edge]);
             }
         }
+    console.log(`[scan] tokens=${tokens.size}, raw_triangles=${rawTriangles}, profitable=${out.length}`);
+    console.log('[scan] drop summary=', dropCounts);
+    if (rawTriangles === 0) {
+        console.log('[scan] sample edges=', edges.slice(0, 10).map(e => `${e.from}->${e.to}`));
+    }
     return out;
 }
 //# sourceMappingURL=findTri.js.map
