@@ -34,17 +34,21 @@ export const CFG = {
     orca: {
       solUsdc: process.env.ORCA_SOL_USDC_POOL ?? '',
       msolSol: process.env.ORCA_MSOL_SOL_POOL ?? '',
-      solUsdt: process.env.ORCA_SOL_USDT_POOL ?? ''
+      solUsdt: process.env.ORCA_SOL_USDT_POOL ?? '',
+      bonkSol: process.env.ORCA_BONK_SOL_POOL ?? ''
     },
     ray: {
       solUsdc: process.env.RAY_CLMM_SOL_USDC ?? '',
       bonkUsdc: process.env.RAY_CLMM_BONK_USDC ?? '',
-      jupUsdc: process.env.RAY_CLMM_JUP_USDC ?? ''
+      jupUsdc: process.env.RAY_CLMM_JUP_USDC ?? '',
+      usdcUsdt: process.env.RAY_CLMM_USDC_USDT ?? '',
+      msolUsdc: process.env.RAY_CLMM_MSOL_USDC ?? ''
     },
     meteora: {
       solUsdc: process.env.METEORA_DLMM_SOL_USDC ?? '',
       bonkUsdc: process.env.METEORA_DLMM_BONK_USDC ?? '',
-      jupUsdc: process.env.METEORA_DLMM_JUP_USDC ?? ''
+      jupUsdc: process.env.METEORA_DLMM_JUP_USDC ?? '',
+      bonkSol: process.env.METEORA_DLMM_BONK_SOL ?? ''
     }
   },
 
