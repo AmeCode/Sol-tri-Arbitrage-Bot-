@@ -33,41 +33,57 @@ export function makeOrcaEdge(
     feeBps: 0,
 
     async quoteOut(amountIn: bigint): Promise<bigint> {
-      const pool = await client.getPool(poolPk);
-      const inputMint = getInputMint(this.from);
-      const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
+      try {
+        const pool = await client.getPool(poolPk);
+        const inputMint = getInputMint(this.from);
+        const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
 
-      const quote = await swapQuoteByInputToken(
-        pool,
-        inputMint,
-        new BN(amountIn.toString()),          // BN, not Decimal
-        slippage,
-        ctx.program.programId,
-        ctx.fetcher,
-        { maxAge: 0 },                        // <-- VALID SimpleAccountFetchOptions
-        UseFallbackTickArray.Never            // (or .Auto / .Always)
-      );
-      return BigInt(quote.estimatedAmountOut.toString());
+        const quote = await swapQuoteByInputToken(
+          pool,
+          inputMint,
+          new BN(amountIn.toString(), 10),
+          slippage,
+          ctx.program.programId,
+          ctx.fetcher,
+          { maxAge: 0 },
+          UseFallbackTickArray.Never
+        );
+
+        const out = quote.estimatedAmountOut;
+        if (out.lte(new BN(0))) {
+          console.warn(`[orca] non-positive out for ${this.id} -> ${out.toString()}`);
+          return 0n;
+        }
+        return BigInt(out.toString());
+      } catch (e) {
+        console.warn(`[orca] quote error ${this.id}:`, (e as Error).message);
+        return 0n;
+      }
     },
 
     async buildSwapIx(amountIn: bigint, _minOut: bigint, _user: PublicKey): Promise<TransactionInstruction[]> {
-      const pool = await client.getPool(poolPk);
-      const inputMint = getInputMint(this.from);
-      const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
+      try {
+        const pool = await client.getPool(poolPk);
+        const inputMint = getInputMint(this.from);
+        const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
 
-      const quote = await swapQuoteByInputToken(
-        pool,
-        inputMint,
-        new BN(amountIn.toString()),
-        slippage,
-        ctx.program.programId,
-        ctx.fetcher,
-        { maxAge: 0 },                        // <-- remove `refresh`
-        UseFallbackTickArray.Never
-      );
+        const quote = await swapQuoteByInputToken(
+          pool,
+          inputMint,
+          new BN(amountIn.toString(), 10),
+          slippage,
+          ctx.program.programId,
+          ctx.fetcher,
+          { maxAge: 0 },
+          UseFallbackTickArray.Never
+        );
 
-      const tb = await pool.swap(quote);
-      return tb.compressIx(false).instructions;
+        const tb = await pool.swap(quote);
+        return tb.compressIx(false).instructions;
+      } catch (e) {
+        console.warn(`[orca] buildSwapIx error ${this.id}:`, (e as Error).message);
+        return [];
+      }
     }
   };
 }

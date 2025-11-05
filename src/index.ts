@@ -7,6 +7,8 @@ import { startMetrics, cBundlesOk, cBundlesSent, cSimFail, cExecFail, gIncludeRa
 import { Keypair, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { searcherClient } from 'jito-ts/dist/sdk/block-engine/searcher.js';
+import { makeSizeLadder } from './amounts.js';
+import type { PoolEdge } from './graph/types.js';
 
 async function getFreshHashSafe(read: any, send: any) {
   try { return await send.getLatestBlockhash('processed'); }
@@ -32,6 +34,21 @@ async function main() {
   // Build edges and set up WS subs inside builder
   const edges = await buildEdges();
   console.log(`[init] edges=${edges.length}, tokens=${CFG.tokensUniverse.length}`);
+
+  const humanSizes = CFG.sizeLadderHuman;
+  const ladderByEdge = new Map<string, ReturnType<typeof makeSizeLadder>>();
+  const ladderKey = (edge: PoolEdge) => `${edge.id}|${edge.from}`;
+
+  for (const edge of edges) {
+    try {
+      const ladder = makeSizeLadder(humanSizes, edge.from);
+      ladderByEdge.set(ladderKey(edge), ladder);
+    } catch (e) {
+      console.warn(`[ladder] failed for ${edge.id} (${edge.from}):`, (e as Error).message);
+    }
+  }
+
+  const seedHuman = humanSizes[0] ?? 'n/a';
 
   // Jito BE client (public mode; no auth key)
   const jito = searcherClient(CFG.jitoUrl as any, undefined as any);
@@ -67,13 +84,12 @@ async function main() {
       cScansTotal.inc();
       console.log('[scan] start');
       console.log(`[scan] edges=${edges.length}`);
-      const seed = CFG.sizeLadder[0]; // seed for candidate scan
-      console.log(`[scan] building candidates with seed=${seed}`);
-      const candidates = await findTriCandidates(edges, seed);
+      console.log(`[scan] building candidates with seed=${seedHuman} (input units)`);
+      const candidates = await findTriCandidates(edges, edge => ladderByEdge.get(ladderKey(edge)));
       console.log(`[scan] candidates=${candidates.length}`);
 
       for (const path of candidates) {
-        const sized = await bestSize(path, CFG.sizeLadder);
+        const sized = await bestSize(path, edge => ladderByEdge.get(ladderKey(edge)));
         if (!sized) continue;
 
         const routeId = path.map(e => e.id).join(' -> ');
