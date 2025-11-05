@@ -8,6 +8,7 @@ import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
 import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
 import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
 import { canonicalMint, WSOL_MINT } from '../util/mints.js';
+import { loadRayIndexOnce } from '../initRay.js';
 
 console.log('[cfg] pools.orca', CFG.pools.orca);
 console.log('[cfg] pools.ray', CFG.pools.ray);
@@ -38,6 +39,8 @@ function mintForSymbol(symbol: string, envKey: string): string {
 export async function buildEdges(): Promise<PoolEdge[]> {
   const { read } = makeConnections();
   const cache = new WsAccountCache(read);
+
+  await loadRayIndexOnce();
 
   // Wallet pubkey is only needed by Orca SDK context (dummy signer ok)
   const dummyWallet = new PublicKey(WSOL_MINT); // any 32B pk works; real payer signs in index.ts
