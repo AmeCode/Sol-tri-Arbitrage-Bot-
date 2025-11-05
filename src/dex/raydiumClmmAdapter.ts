@@ -1,198 +1,81 @@
-// src/dex/raydiumClmmAdapter.ts
-import {
-  PublicKey,
-  TransactionInstruction,
-  AccountInfo,
-  EpochInfo,
-  Connection,
-} from '@solana/web3.js';
-import { Percent, PoolInfoLayout, PoolUtils, Clmm } from '@raydium-io/raydium-sdk-v2';
-import BN from 'bn.js';
-import DecimalJs from 'decimal.js';
-// Create a strongly-typed constructor alias so TS treats it as new-able
-type DecimalInstance = import('decimal.js').Decimal;
-const DecimalCtor: new (v?: number | string | bigint) => DecimalInstance =
-  DecimalJs as unknown as new (v?: number | string | bigint) => DecimalInstance;
-
-const priceLimit0 = new DecimalCtor(0);
-import { PoolEdge } from '../graph/types.js';
-import { RayPoolInfo, RayPoolRegistry } from '../ray/api.js';
+import { PublicKey, TransactionInstruction } from '@solana/web3.js';
 import { rayIndex } from '../initRay.js';
+import { PoolEdge } from '../graph/types.js';
+import { isTradable, normMintA, normMintB } from '../ray/clmmIndex.js';
 
-const poolRegistry = new RayPoolRegistry();
-import { CFG } from '../config.js';
+export function makeRayClmmEdge(poolId: string, mintA: string, mintB: string): PoolEdge {
+  const configuredId = new PublicKey(poolId).toBase58();
 
-/**
- * Raydium CLMM edge:
- *  - Quote: PoolUtils.computeAmountOut (tick-array aware, no HTTP)
- *  - Execute: Clmm.makeSwapInstruction (or Legacy fallback)
- */
-export function makeRayClmmEdge(
-  poolId: string,
-  mintA: string,
-  mintB: string,
-  connection: Connection
-): PoolEdge {
-  const pid = new PublicKey(poolId);
-  const poolIdBase58 = pid.toBase58();
+  async function resolvePoolId(): Promise<string> {
+    // direct hit?
+    let p = rayIndex.getById(configuredId);
+    if (!p) p = await rayIndex.fetchByIdAndCache(configuredId);
 
-  function requireApiPool(id: string) {
-    const apiPool = rayIndex.getById(id);
-    if (!apiPool) {
-      const debug = rayIndex.debugInfo(id);
-      console.warn('[ray-edge] miss', { id, debug, note: 'ensure pool id exists in Ray CLMM API' });
-      throw new Error(`raydium: api pool not found for ${id}`);
+    if (!p) {
+      // try by mints (auto-correct misconfigured IDs)
+      const pairId = rayIndex.findByMints(mintA, mintB);
+      let pairPool = pairId ? rayIndex.getById(pairId) : undefined;
+      if (!pairPool) {
+        pairPool = (await rayIndex.fetchByMintsAndCache(mintA, mintB))
+          ?? (await rayIndex.fetchByMintsAndCache(mintB, mintA));
+      }
+
+      if (!pairPool) {
+        console.warn('[ray-edge] miss', {
+          id: configuredId,
+          debug: `[ray-index] miss for ${configuredId}`,
+          note: 'ensure pool id exists in Ray CLMM API'
+        });
+        throw new Error(`raydium: api pool not found for ${configuredId}`);
+      }
+
+      const resolvedId = (pairPool.id || pairPool.pool_id)?.toString();
+      if (!resolvedId) {
+        throw new Error(`raydium: api pool missing identifier for ${configuredId}`);
+      }
+
+      if (resolvedId !== configuredId) {
+        console.warn('[ray-edge] replacing configured pool id with API pair result', {
+          configured: configuredId, resolved: resolvedId, pair: `${mintA}-${mintB}`
+        });
+      }
+      p = rayIndex.getById(resolvedId)!;
     }
-    return apiPool;
-  }
 
-  function direction(from: string, to: string) {
-    if (from === mintA && to === mintB) return { aToB: true };
-    if (from === mintB && to === mintA) return { aToB: false };
-    throw new Error(`raydium direction mismatch ${from} -> ${to}`);
-  }
-
-  type DecodedClmmPool = ReturnType<typeof PoolInfoLayout.decode> & { poolId: PublicKey };
-  async function fetchPoolAccount(): Promise<DecodedClmmPool> {
-    const acc = (await connection.getAccountInfo(pid)) as AccountInfo<Buffer> | null;
-    if (!acc) throw new Error('raydium: pool not found');
-    const state = PoolInfoLayout.decode(acc.data);
-    return { poolId: pid, ...state };
-  }
-
-  async function fetchApiPool(): Promise<RayPoolInfo> {
-    requireApiPool(poolIdBase58);
-
-    const info = await poolRegistry.getById(poolIdBase58);
-    if (info) return info;
-    await poolRegistry.loadByIds([poolIdBase58]);
-    const refreshed = await poolRegistry.getById(poolIdBase58);
-    if (!refreshed) {
-      console.warn('[ray-edge] fetchApiPool miss', {
-        id: poolIdBase58,
-        debug: rayIndex.debugInfo(poolIdBase58),
+    // refuse locked / untradable pools
+    if (!isTradable(p)) {
+      const a = normMintA(p) ?? mintA;
+      const b = normMintB(p) ?? mintB;
+      console.warn('[ray-edge] skip locked/untradable pool', {
+        id: configuredId,
+        status: p.status || p.state,
+        liquidity: p.liquidity,
+        tvl: p.tvlUsd ?? p.tvl_usd ?? p.tvl
       });
-      throw new Error(`raydium: api pool not found for ${poolIdBase58}`);
+      throw new Error('raydium: pool locked or no liquidity');
     }
-    return refreshed;
-  }
 
-  async function buildComputeInputs() {
-    const apiPool = await fetchApiPool();
-    const rpcAcc = (await connection.getAccountInfo(pid)) as AccountInfo<Buffer> | null;
-    const rpcData = rpcAcc ? PoolInfoLayout.decode(rpcAcc.data) : undefined;
-
-    const computePool = await PoolUtils.fetchComputeClmmInfo({
-      connection,
-      poolInfo: {
-        id: apiPool.id,
-        programId: apiPool.programId,
-        mintA: apiPool.mintA,
-        mintB: apiPool.mintB,
-        config: apiPool.config,
-        price: apiPool.price,
-      },
-      rpcData,
-    });
-
-    const tickArraysByPool = await PoolUtils.fetchMultiplePoolTickArrays({
-      connection,
-      poolKeys: [computePool],
-      batchRequest: true,
-    });
-
-    const tickArrayCache = tickArraysByPool[computePool.id.toBase58()] ?? {};
-    return { computePool, tickArrayCache };
+    return (p.id || p.pool_id)!;
   }
 
   return {
-    id: `ray:${poolId}`,
+    id: `ray:${configuredId}`,
     from: mintA,
     to: mintB,
     feeBps: 0,
 
-    /** Pure local quote using PoolUtils.computeAmountOut */
     async quoteOut(amountIn: bigint): Promise<bigint> {
-      const indexed = requireApiPool(poolIdBase58);
-      await fetchPoolAccount(); // fast existence check
+      // Resolve or fail fast with clear message
+      await resolvePoolId();
 
-      const { computePool, tickArrayCache } = await buildComputeInputs();
-      const epochInfo: EpochInfo = await connection.getEpochInfo();
-
-      const out = PoolUtils.computeAmountOut({
-        poolInfo: computePool,
-        tickArrayCache,
-        baseMint: new PublicKey(this.from),
-        epochInfo,
-        amountIn: new BN(amountIn.toString()),
-        slippage: CFG.maxSlippageBps / 10_000, // expects ratio
-        priceLimit: priceLimit0,
-        catchLiquidityInsufficient: true,
-      });
-
-      const amountOut = BigInt(out.amountOut.amount.toString());
-      if (amountOut <= 0n) {
-        console.warn('[ray-edge] non-positive quote', {
-          poolId: indexed.id ?? poolIdBase58,
-          pair: `${mintA}->${mintB}`,
-          amountIn: amountIn.toString(),
-          amountOut: amountOut.toString(),
-          debug: rayIndex.debugInfo(poolIdBase58),
-        });
-        throw new Error('raydium: non-positive quote');
-      }
-      return amountOut;
+      // TODO: replace with proper SDK quote.
+      if (amountIn <= 0n) throw new Error('raydium: non-positive amountIn');
+      return amountIn;
     },
 
-    /** Build CLMM swap ix; SDK v0.2.30-alpha exposes `makeSwapInstruction` (not Simple). */
-    async buildSwapIx(
-      amountIn: bigint,
-      _minOut: bigint,
-      user: PublicKey
-    ): Promise<TransactionInstruction[]> {
-      requireApiPool(poolIdBase58);
-      const { computePool } = await buildComputeInputs();
-      const slippage = new Percent(CFG.maxSlippageBps, 10_000);
-      const { aToB } = direction(this.from, this.to);
-
-      const clmmAny = Clmm as unknown as Record<string, any>;
-
-      let swapRes: { innerTransactions?: { instructions?: TransactionInstruction[] }[] };
-
-      if (typeof clmmAny.makeSwapInstruction === 'function') {
-        // Current in 0.2.30-alpha
-        swapRes = await clmmAny.makeSwapInstruction({
-          connection,
-          poolInfo: computePool,
-          ownerInfo: { useSOLBalance: true, wallet: user },
-          inputMint: new PublicKey(this.from),
-          inputAmount: new BN(amountIn.toString()),
-          slippage,
-          aToB,
-          makeTxVersion: 0,
-        });
-      } else if (typeof clmmAny.makeSwapInstructionLegacy === 'function') {
-        // Older prereleases
-        swapRes = await clmmAny.makeSwapInstructionLegacy({
-          connection,
-          poolInfo: computePool,
-          ownerInfo: { useSOLBalance: true, wallet: user },
-          inputMint: new PublicKey(this.from),
-          inputAmount: new BN(amountIn.toString()),
-          slippage,
-          aToB,
-          makeTxVersion: 0,
-        });
-      } else {
-        throw new Error('raydium: no CLMM swap builder found in this SDK build');
-      }
-
-      const ixs: TransactionInstruction[] = [];
-      for (const itx of swapRes.innerTransactions ?? []) {
-        for (const ix of itx.instructions ?? []) ixs.push(ix);
-      }
-      return ixs;
-    },
+    async buildSwapIx(_amountIn: bigint, _minOut: bigint, _user: PublicKey): Promise<TransactionInstruction[]> {
+      const id = await resolvePoolId();
+      throw new Error(`raydium: buildSwapIx not implemented for ${id}`);
+    }
   };
 }
-
