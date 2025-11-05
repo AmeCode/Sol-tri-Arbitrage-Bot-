@@ -6,13 +6,7 @@ import {
   EpochInfo,
   Connection,
 } from '@solana/web3.js';
-import {
-  Api,
-  Percent,
-  PoolInfoLayout,
-  PoolUtils,
-  Clmm, // note: we’ll feature-detect method names at runtime
-} from '@raydium-io/raydium-sdk-v2';
+import { Percent, PoolInfoLayout, PoolUtils, Clmm } from '@raydium-io/raydium-sdk-v2';
 import BN from 'bn.js';
 import DecimalJs from 'decimal.js';
 // Create a strongly-typed constructor alias so TS treats it as new-able
@@ -22,6 +16,9 @@ const DecimalCtor: new (v?: number | string | bigint) => DecimalInstance =
 
 const priceLimit0 = new DecimalCtor(0);
 import { PoolEdge } from '../graph/types.js';
+import { RayPoolInfo, RayPoolRegistry } from '../ray/api.js';
+
+const poolRegistry = new RayPoolRegistry();
 import { CFG } from '../config.js';
 
 /**
@@ -36,7 +33,6 @@ export function makeRayClmmEdge(
   connection: Connection
 ): PoolEdge {
   const pid = new PublicKey(poolId);
-  const api = new Api({ cluster: 'mainnet', timeout: 12_000 });
 
   function direction(from: string, to: string) {
     if (from === mintA && to === mintB) return { aToB: true };
@@ -52,34 +48,13 @@ export function makeRayClmmEdge(
     return { poolId: pid, ...state };
   }
 
-  type ApiConcentratedPool = {
-    id: string;
-    programId: string;
-    mintA: string;
-    mintB: string;
-    config: unknown;
-    price: unknown;
-    type: 'Concentrated';
-    [key: string]: unknown;
-  };
-
-  function isConcentratedPool(value: unknown): value is ApiConcentratedPool {
-    if (!value || typeof value !== 'object') return false;
-    const pool = value as Partial<ApiConcentratedPool>;
-    return (
-      pool.type === 'Concentrated' &&
-      typeof pool.id === 'string' &&
-      typeof pool.programId === 'string' &&
-      typeof pool.mintA === 'string' &&
-      typeof pool.mintB === 'string'
-    );
-  }
-
-  async function fetchApiPool(): Promise<ApiConcentratedPool> {
-    const res = (await api.fetchPoolById({ ids: poolId })) as unknown[];
-    const item = res.find((p: unknown): p is ApiConcentratedPool => isConcentratedPool(p) && p.id === poolId);
-    if (!item) throw new Error(`raydium: api pool not found for ${poolId}`);
-    return item;
+  async function fetchApiPool(): Promise<RayPoolInfo> {
+    const info = await poolRegistry.getById(poolId);
+    if (info) return info;
+    await poolRegistry.loadByIds([poolId]);
+    const refreshed = await poolRegistry.getById(poolId);
+    if (!refreshed) throw new Error(`raydium: api pool not found for ${poolId}`);
+    return refreshed;
   }
 
   async function buildComputeInputs() {
