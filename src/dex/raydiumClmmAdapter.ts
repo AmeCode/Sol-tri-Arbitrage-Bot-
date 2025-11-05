@@ -17,6 +17,7 @@ const DecimalCtor: new (v?: number | string | bigint) => DecimalInstance =
 const priceLimit0 = new DecimalCtor(0);
 import { PoolEdge } from '../graph/types.js';
 import { RayPoolInfo, RayPoolRegistry } from '../ray/api.js';
+import { rayIndex } from '../initRay.js';
 
 const poolRegistry = new RayPoolRegistry();
 import { CFG } from '../config.js';
@@ -33,6 +34,17 @@ export function makeRayClmmEdge(
   connection: Connection
 ): PoolEdge {
   const pid = new PublicKey(poolId);
+  const poolIdBase58 = pid.toBase58();
+
+  function requireApiPool(id: string) {
+    const apiPool = rayIndex.getById(id);
+    if (!apiPool) {
+      const debug = rayIndex.debugInfo(id);
+      console.warn('[ray-edge] miss', { id, debug, note: 'ensure pool id exists in Ray CLMM API' });
+      throw new Error(`raydium: api pool not found for ${id}`);
+    }
+    return apiPool;
+  }
 
   function direction(from: string, to: string) {
     if (from === mintA && to === mintB) return { aToB: true };
@@ -49,11 +61,19 @@ export function makeRayClmmEdge(
   }
 
   async function fetchApiPool(): Promise<RayPoolInfo> {
-    const info = await poolRegistry.getById(poolId);
+    requireApiPool(poolIdBase58);
+
+    const info = await poolRegistry.getById(poolIdBase58);
     if (info) return info;
-    await poolRegistry.loadByIds([poolId]);
-    const refreshed = await poolRegistry.getById(poolId);
-    if (!refreshed) throw new Error(`raydium: api pool not found for ${poolId}`);
+    await poolRegistry.loadByIds([poolIdBase58]);
+    const refreshed = await poolRegistry.getById(poolIdBase58);
+    if (!refreshed) {
+      console.warn('[ray-edge] fetchApiPool miss', {
+        id: poolIdBase58,
+        debug: rayIndex.debugInfo(poolIdBase58),
+      });
+      throw new Error(`raydium: api pool not found for ${poolIdBase58}`);
+    }
     return refreshed;
   }
 
@@ -93,6 +113,7 @@ export function makeRayClmmEdge(
 
     /** Pure local quote using PoolUtils.computeAmountOut */
     async quoteOut(amountIn: bigint): Promise<bigint> {
+      const indexed = requireApiPool(poolIdBase58);
       await fetchPoolAccount(); // fast existence check
 
       const { computePool, tickArrayCache } = await buildComputeInputs();
@@ -109,7 +130,18 @@ export function makeRayClmmEdge(
         catchLiquidityInsufficient: true,
       });
 
-      return BigInt(out.amountOut.amount.toString());
+      const amountOut = BigInt(out.amountOut.amount.toString());
+      if (amountOut <= 0n) {
+        console.warn('[ray-edge] non-positive quote', {
+          poolId: indexed.id ?? poolIdBase58,
+          pair: `${mintA}->${mintB}`,
+          amountIn: amountIn.toString(),
+          amountOut: amountOut.toString(),
+          debug: rayIndex.debugInfo(poolIdBase58),
+        });
+        throw new Error('raydium: non-positive quote');
+      }
+      return amountOut;
     },
 
     /** Build CLMM swap ix; SDK v0.2.30-alpha exposes `makeSwapInstruction` (not Simple). */
@@ -118,6 +150,7 @@ export function makeRayClmmEdge(
       _minOut: bigint,
       user: PublicKey
     ): Promise<TransactionInstruction[]> {
+      requireApiPool(poolIdBase58);
       const { computePool } = await buildComputeInputs();
       const slippage = new Percent(CFG.maxSlippageBps, 10_000);
       const { aToB } = direction(this.from, this.to);
