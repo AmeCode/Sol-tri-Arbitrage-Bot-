@@ -9,6 +9,11 @@ import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
 import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
 import { canonicalMint, WSOL_MINT } from '../util/mints.js';
 
+console.log('[cfg] pools.orca', CFG.pools.orca);
+console.log('[cfg] pools.ray', CFG.pools.ray);
+console.log('[cfg] pools.meteora', CFG.pools.meteora);
+console.log('[cfg] tokens', CFG.tokensUniverse);
+
 const MINTS = {
   SOL: 'So11111111111111111111111111111111111111112',
   USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
@@ -17,6 +22,18 @@ const MINTS = {
   JUP:  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
   MSOL: 'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So'
 };
+
+function mintForSymbol(symbol: string, envKey: string): string {
+  const normalized = symbol?.trim().toUpperCase();
+  if (!normalized) {
+    throw new Error(`[builder] token symbol missing for ${envKey}`);
+  }
+  const mint = (MINTS as Record<string, string>)[normalized];
+  if (!mint) {
+    throw new Error(`[builder] no mint mapping for ${normalized} (from ${envKey})`);
+  }
+  return mint;
+}
 
 export async function buildEdges(): Promise<PoolEdge[]> {
   const { read } = makeConnections();
@@ -29,17 +46,13 @@ export async function buildEdges(): Promise<PoolEdge[]> {
   const edges: PoolEdge[] = [];
 
   // ---- Orca Whirlpools (subscribe to pool accounts) ----
-  const orcaPools = [
-    { id: CFG.pools.orca.solUsdc, a: MINTS.SOL, b: MINTS.USDC },
-    { id: CFG.pools.orca.msolSol, a: MINTS.MSOL, b: MINTS.SOL },
-    { id: CFG.pools.orca.solUsdt, a: MINTS.SOL, b: MINTS.USDT }
-  ].filter(p => p.id);
+  const orcaPools = CFG.pools.orca;
 
   for (const p of orcaPools) {
     const poolPk = new PublicKey(p.id);
     cache.subscribe(poolPk);
-    const fromMint = canonicalMint(p.a);
-    const toMint = canonicalMint(p.b);
+    const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
+    const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
       { ...makeOrcaEdge(p.id, fromMint, toMint, orcaCtx), from: fromMint, to: toMint },
       { ...makeOrcaEdge(p.id, fromMint, toMint, orcaCtx), from: toMint, to: fromMint }
@@ -47,15 +60,11 @@ export async function buildEdges(): Promise<PoolEdge[]> {
   }
 
   // ---- Raydium CLMM ----
-  const rayPools = [
-    { id: CFG.pools.ray.solUsdc, a: MINTS.SOL, b: MINTS.USDC },
-    { id: CFG.pools.ray.bonkUsdc, a: MINTS.BONK, b: MINTS.USDC },
-    { id: CFG.pools.ray.jupUsdc,  a: MINTS.JUP,  b: MINTS.USDC }
-  ].filter(p => p.id);
+  const rayPools = CFG.pools.ray;
 
   for (const p of rayPools) {
-    const fromMint = canonicalMint(p.a);
-    const toMint = canonicalMint(p.b);
+    const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
+    const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
       { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: fromMint, to: toMint },
       { ...makeRayClmmEdge(p.id, fromMint, toMint, read), from: toMint, to: fromMint }
@@ -63,15 +72,11 @@ export async function buildEdges(): Promise<PoolEdge[]> {
   }
 
   // ---- Meteora DLMM (Micro-liquidity bins) ----
-  const dlmms = [
-    { id: CFG.pools.meteora.solUsdc, a: MINTS.SOL,  b: MINTS.USDC },
-    { id: CFG.pools.meteora.bonkUsdc, a: MINTS.BONK, b: MINTS.USDC },
-    { id: CFG.pools.meteora.jupUsdc,  a: MINTS.JUP,  b: MINTS.USDC }
-  ].filter(p => p.id);
+  const dlmms = CFG.pools.meteora;
 
   for (const p of dlmms) {
-    const fromMint = canonicalMint(p.a);
-    const toMint = canonicalMint(p.b);
+    const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
+    const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
       { ...makeMeteoraEdge(p.id, fromMint, toMint), from: fromMint, to: toMint },
       { ...makeMeteoraEdge(p.id, toMint, fromMint), from: toMint, to: fromMint }

@@ -6,6 +6,35 @@ function req(name: string): string {
   return v;
 }
 
+export type PoolDef = {
+  /** full env var name */
+  key: string;
+  /** on-chain pool address */
+  id: string;
+  /** token symbols from the env var name (uppercased) */
+  a: string;
+  b: string;
+};
+
+/** Load pools whose env var names match: PREFIX_A_B or PREFIX_A_B_POOL */
+function loadPools(prefix: string): PoolDef[] {
+  // Example matches:
+  //  - ORCA_SOL_USDC_POOL
+  //  - RAY_CLMM_MSOL_USDC
+  //  - METEORA_DLMM_BONK_SOL
+  const rx = new RegExp(`^${prefix}([A-Z0-9]+)_([A-Z0-9]+)(?:_POOL)?$`);
+  const out: PoolDef[] = [];
+
+  for (const [key, val] of Object.entries(process.env)) {
+    if (!val) continue;
+    const m = key.match(rx);
+    if (!m) continue;
+    const [, a, b] = m;
+    out.push({ key, id: val, a, b });
+  }
+  return out;
+}
+
 export const CFG = {
   rpcRead: req('RPC_URL_READ'),
   rpcSend: req('RPC_URL_SEND'),
@@ -14,7 +43,10 @@ export const CFG = {
   jitoUrl: req('BLOCK_ENGINE_URL'),
   metricsPort: Number(process.env.METRICS_PORT ?? 9102),
 
-  tokensUniverse: (process.env.TOKENS ?? '').split(',').filter(Boolean),
+  tokensUniverse: (process.env.TOKENS ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
 
   priorityFeeMin: Number(process.env.PRIORITY_FEE_MIN ?? 5000),
   priorityFeeMax: Number(process.env.PRIORITY_FEE_MAX ?? 40000),
@@ -27,31 +59,23 @@ export const CFG = {
   haltOnNegativeSim: String(process.env.HALT_ON_NEGATIVE_SIM ?? 'false') === 'true',
 
   sizeLadder: (process.env.SIZE_LADDER ?? '1000000,2000000,5000000')
-    .split(',').map(s => BigInt(s.trim())),
+    .split(',')
+    .map(s => BigInt(s.trim())),
 
-  // Pools
+  // Dynamically discovered pools from .env
   pools: {
-    orca: {
-      solUsdc: process.env.ORCA_SOL_USDC_POOL ?? '',
-      msolSol: process.env.ORCA_MSOL_SOL_POOL ?? '',
-      solUsdt: process.env.ORCA_SOL_USDT_POOL ?? '',
-      bonkSol: process.env.ORCA_BONK_SOL_POOL ?? ''
-    },
-    ray: {
-      solUsdc: process.env.RAY_CLMM_SOL_USDC ?? '',
-      bonkUsdc: process.env.RAY_CLMM_BONK_USDC ?? '',
-      jupUsdc: process.env.RAY_CLMM_JUP_USDC ?? '',
-      usdcUsdt: process.env.RAY_CLMM_USDC_USDT ?? '',
-      msolUsdc: process.env.RAY_CLMM_MSOL_USDC ?? ''
-    },
-    meteora: {
-      solUsdc: process.env.METEORA_DLMM_SOL_USDC ?? '',
-      bonkUsdc: process.env.METEORA_DLMM_BONK_USDC ?? '',
-      jupUsdc: process.env.METEORA_DLMM_JUP_USDC ?? '',
-      bonkSol: process.env.METEORA_DLMM_BONK_SOL ?? ''
-    }
+    orca: loadPools('ORCA_'),
+    ray: loadPools('RAY_CLMM_'),
+    meteora: loadPools('METEORA_DLMM_'),
   },
 
   maxSlippageBps: 20,
 };
 
+// Optional: one-time sanity logs
+if (process.env.CONFIG_DEBUG === '1') {
+  console.log('[cfg] orca', CFG.pools.orca);
+  console.log('[cfg] ray', CFG.pools.ray);
+  console.log('[cfg] meteora', CFG.pools.meteora);
+  console.log('[cfg] tokens', CFG.tokensUniverse);
+}
