@@ -9,6 +9,7 @@ export const cBundlesSent = new Counter({ name: 'arb_bundles_sent_total', help: 
 export const cBundlesOk = new Counter({ name: 'arb_bundles_ok_total', help: 'bundles included', registers: [reg] });
 export const cSimFail = new Counter({ name: 'arb_sim_fail_total', help: 'simulation fails', registers: [reg] });
 export const cExecFail = new Counter({ name: 'arb_exec_fail_total', help: 'send fails', registers: [reg] });
+export const cScansTotal = new Counter({ name: 'arb_scans_total', help: 'arb loop iterations', registers: [reg] });
 export function startMetrics() {
     const app = express();
     app.get('/metrics', async (_req, res) => {
