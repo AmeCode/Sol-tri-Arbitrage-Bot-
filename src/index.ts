@@ -140,18 +140,11 @@ async function main() {
           continue;
         }
 
-        if (swapIxs.length > 3) {
-          console.warn('[route] built more than 3 instructions, skipping for labeling helper', swapIxs.length);
-          continue;
-        }
-
         try {
           const sig = await executeRoute(
             sendConn,
             wallet,
-            swapIxs[0],
-            swapIxs[1],
-            swapIxs[2],
+            swapIxs,
             priorityFee,
           );
           console.log('[bundle/send] success', sig);

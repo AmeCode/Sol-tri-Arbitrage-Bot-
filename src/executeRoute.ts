@@ -1,63 +1,54 @@
-import {
-  Connection,
-  Keypair,
-  TransactionInstruction,
-  ComputeBudgetProgram,
-} from '@solana/web3.js';
+import { Connection, Keypair, TransactionInstruction, ComputeBudgetProgram } from '@solana/web3.js';
 import { buildAndMaybeLut } from './tx.js';
-import { sendAndConfirmAny, simulateWithLogs } from './send.js';
+import { simulateWithLogs, sendAndConfirmAny } from './send.js';
 import { CFG } from './config.js';
 
 export async function executeRoute(
   connection: Connection,
-  payer: Keypair,
-  hop1: TransactionInstruction,
-  hop2?: TransactionInstruction,
-  hop3?: TransactionInstruction,
-  priFeeMicroLamports?: number,
+  wallet: Keypair,
+  ixs: TransactionInstruction[],
+  priorityFeeMicroLamports: number,
 ) {
-  const ixs: TransactionInstruction[] = [];
+  const allInstructions: TransactionInstruction[] = [];
 
-  // Prelude: compute tweaks
   if (CFG.cuLimit > 0) {
-    ixs.push(ComputeBudgetProgram.setComputeUnitLimit({ units: CFG.cuLimit }));
+    allInstructions.push(ComputeBudgetProgram.setComputeUnitLimit({ units: CFG.cuLimit }));
   }
-  if ((priFeeMicroLamports ?? 0) > 0) {
-    ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priFeeMicroLamports! }));
+  if ((priorityFeeMicroLamports ?? 0) > 0) {
+    allInstructions.push(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
+    );
   }
 
-  // Hops
-  ixs.push(hop1);
-  if (hop2) ixs.push(hop2);
-  if (hop3) ixs.push(hop3);
+  allInstructions.push(...ixs);
 
   if (CFG.debugSim) {
-    console.log('[route] instructions count =', ixs.length);
+    console.log('[route] instructions count =', allInstructions.length);
   }
 
   const built = await buildAndMaybeLut(
     connection,
-    payer.publicKey,
-    payer,
-    ixs,
-    priFeeMicroLamports,
+    wallet.publicKey,
+    wallet,
+    allInstructions,
+    priorityFeeMicroLamports,
   );
 
-  // helpful banner
   if ('lutAddressUsed' in built && (built as any).lutAddressUsed) {
     console.log('[lut] used', (built as any).lutAddressUsed.toBase58());
   }
 
-  // SIMULATE (always prints banners due to CFG.debugSim)
-  const sim = await simulateWithLogs(connection, built, [payer]);
+  const sim = await simulateWithLogs(connection, built, [wallet]);
   if (sim.value.err) {
-    console.error('[sim] err', sim.value.err);
-    throw new Error('simulation failed');
+    const err = new Error('simulation failed') as Error & {
+      getLogs?: () => Promise<string[] | null>;
+    };
+    err.getLogs = async () => sim.value.logs ?? null;
+    throw err;
   } else {
     console.log('[sim] ok (no err)');
   }
 
-  // SEND
-  const sig = await sendAndConfirmAny(connection, built, [payer]);
+  const sig = await sendAndConfirmAny(connection, built, [wallet]);
   return sig;
 }
