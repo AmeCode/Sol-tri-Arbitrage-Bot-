@@ -1,11 +1,13 @@
+import { strict as assert } from 'assert';
 import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
 import BN from 'bn.js';
-import { NATIVE_MINT } from '@solana/spl-token';
 
 import { rayIndex } from '../initRay.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { isTradable, normMintA, normMintB } from '../ray/clmmIndex.js';
-import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
+import { ensureAtaIx } from '../tokenAta.js';
+
+const DEBUG = process.env.RAY_CLMM_DEBUG === '1';
 
 type ClmmTools = {
   clmm: any;
@@ -133,78 +135,80 @@ export function makeRayClmmEdge(
     },
 
     async buildSwapIx(
-      _amountIn: bigint,
-      _minOut: bigint,
-      _user: PublicKey,
+      amountIn: bigint,
+      minOut: bigint,
+      user: PublicKey,
     ): Promise<SwapInstructionBundle> {
-      if (_amountIn <= 0n) throw new Error('raydium: amountIn must be > 0');
-      if (_minOut < 0n) throw new Error('raydium: minOut must be >= 0');
+      assert(amountIn > 0n, 'amountIn must be > 0');
+      assert(minOut >= 0n, 'minOut must be >= 0');
 
       const id = await resolvePoolId();
       const poolInfo = await loadPoolInfo(id);
       const poolKeys = await loadPoolKeys(id);
       const { instrument } = await loadClmmTools(connection);
 
-      const fromMintPk = new PublicKey(this.from);
-      const toMintPk = new PublicKey(this.to);
+      const inputMintPk = new PublicKey(this.from);
+      const outputMintPk = new PublicKey(this.to);
+      const mintA = new PublicKey(poolInfo.mintA.address ?? poolInfo.mintA);
+      const mintB = new PublicKey(poolInfo.mintB.address ?? poolInfo.mintB);
 
-      const directionAToB = fromMintPk.equals(mintAPk) && toMintPk.equals(mintBPk);
-      const directionBToA = fromMintPk.equals(mintBPk) && toMintPk.equals(mintAPk);
-      if (!directionAToB && !directionBToA) {
-        throw new Error(`raydium: direction mismatch for pool ${id}`);
-      }
+      const direction =
+        inputMintPk.equals(mintA) && outputMintPk.equals(mintB)
+          ? 'AtoB'
+          : inputMintPk.equals(mintB) && outputMintPk.equals(mintA)
+          ? 'BtoA'
+          : null;
+      if (!direction) throw new Error('Input/output mint mismatch for Raydium CLMM pool');
 
       const setupIxs: TransactionInstruction[] = [];
 
-      let tokenAccountA: PublicKey;
-      if (mintAPk.equals(NATIVE_MINT) && directionAToB) {
-        const wrapped = wrapSolIntoAta(_user, _user, _amountIn);
-        setupIxs.push(...wrapped.ixs);
-        tokenAccountA = wrapped.ata;
-      } else {
-        const ensured = ensureAtaIx(_user, _user, mintAPk);
-        setupIxs.push(...ensured.ixs);
-        tokenAccountA = ensured.ata;
-      }
+      const ensureA = ensureAtaIx(user, user, mintA);
+      const ensureB = ensureAtaIx(user, user, mintB);
+      setupIxs.push(...ensureA.ixs, ...ensureB.ixs);
 
-      let tokenAccountB: PublicKey;
-      if (mintBPk.equals(NATIVE_MINT) && directionBToA) {
-        const wrapped = wrapSolIntoAta(_user, _user, _amountIn);
-        setupIxs.push(...wrapped.ixs);
-        tokenAccountB = wrapped.ata;
-      } else {
-        const ensured = ensureAtaIx(_user, _user, mintBPk);
-        setupIxs.push(...ensured.ixs);
-        tokenAccountB = ensured.ata;
-      }
-
-      const inputMintPk = directionAToB ? mintAPk : mintBPk;
+      const tokenAccountA = ensureA.ata;
+      const tokenAccountB = ensureB.ata;
 
       const ownerInfo = {
-        wallet: _user,
+        wallet: user,
         tokenAccountA,
         tokenAccountB,
       };
 
-      const amountInBn = new BN(_amountIn.toString());
-      const minOutBn = new BN(_minOut.toString());
+      const inputMint = direction === 'AtoB' ? mintA : mintB;
+      const amountInBn = new BN(amountIn.toString());
+      const minOutBn = new BN(minOut.toString());
 
-      const observationId = poolKeys?.observationId ?? poolInfo?.observationId ?? poolInfo?.observationIdKey;
+      const observationId =
+        poolKeys?.observationId ?? poolInfo?.observationId ?? poolInfo?.observationIdKey;
 
       const swap = instrument.makeSwapBaseInInstructions({
         poolInfo,
         poolKeys,
         observationId,
         ownerInfo,
-        inputMint: inputMintPk,
+        inputMint,
         amountIn: amountInBn,
         amountOutMin: minOutBn,
-        sqrtPriceLimitX64: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        sqrtPriceLimitX64: undefined as any,
         remainingAccounts: [],
       });
 
-      const swapIxs: TransactionInstruction[] = swap?.instructions ?? [];
-      return { ixs: [...setupIxs, ...swapIxs] };
+      const rayIxs: TransactionInstruction[] = swap?.instructions ?? [];
+
+      if (DEBUG) {
+        console.debug('[RayCLMM] buildSwapIx', {
+          pool: poolInfo.id?.toString?.() ?? id,
+          dir: direction,
+          amountIn: amountIn.toString(),
+          minOut: minOut.toString(),
+          tokenAccountA: tokenAccountA.toBase58(),
+          tokenAccountB: tokenAccountB.toBase58(),
+        });
+      }
+
+      return { ixs: [...setupIxs, ...rayIxs] };
     }
   };
 }
