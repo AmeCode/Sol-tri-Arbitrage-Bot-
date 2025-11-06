@@ -10,6 +10,7 @@ import {
 } from '@solana/web3.js';
 import { CFG } from './config.js';
 import { ensureLutHas } from './lut.js';
+import { assertNoUnwhitelistedAllocations } from './txGuards.js';
 import { sanitizeWithSignerWhitelist } from './txSanitize.js';
 
 let runtimeLutAddress: PublicKey | null = CFG.lutAddressEnv && CFG.lutAddressEnv.length > 0
@@ -50,7 +51,10 @@ export async function buildAndMaybeLut(
   | { kind: 'legacy'; tx: Transaction; lutAddressUsed?: PublicKey }
   | { kind: 'v0'; tx: VersionedTransaction; lutAddressUsed?: PublicKey }
 > {
+  // 0) Guard BEFORE sanitize so errors point at the offending ix clearly
   const allowed = new Set(extraSignerPubkeys.map(k => k.toBase58()));
+  assertNoUnwhitelistedAllocations(rawInstructions, payer, allowed);
+
   const sanitized = sanitizeWithSignerWhitelist(rawInstructions, payer, allowed);
   const withCb = withComputeBudget(sanitized, cuLimit ?? CFG.cuLimit, cuPriceMicroLamports);
 
