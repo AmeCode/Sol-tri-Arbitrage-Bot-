@@ -10,72 +10,6 @@ import { ensureLutHas } from './lut.js';
 import { buildAndMaybeLut, getRuntimeLutAddress, setRuntimeLutAddress } from './tx.js';
 import { sendAndConfirmAny, simulateWithLogs } from './send.js';
 
-function label(ix: TransactionInstruction, _label: string): TransactionInstruction {
-  return ix;
-}
-
-export async function executeRoute(
-  connection: Connection,
-  payer: Keypair,
-  hop1: TransactionInstruction,
-  hop2?: TransactionInstruction,
-  hop3?: TransactionInstruction,
-  priFeeMicroLamports?: number,
-) {
-  const prelude: TransactionInstruction[] = [];
-  if (CFG.cuLimit > 0) {
-    prelude.push(
-      // @ts-ignore
-      (await import('@solana/web3.js')).ComputeBudgetProgram.setComputeUnitLimit({ units: CFG.cuLimit }),
-    );
-  }
-  if ((priFeeMicroLamports ?? 0) > 0) {
-    prelude.push(
-      // @ts-ignore
-      (await import('@solana/web3.js')).ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priFeeMicroLamports! }),
-    );
-  }
-
-  const labels: string[] = [];
-  const ixs: TransactionInstruction[] = [];
-
-  for (const ix of prelude) {
-    ixs.push(ix);
-    labels.push('[prelude] compute');
-  }
-
-  ixs.push(label(hop1, 'hop1'));
-  labels.push('[swap] hop1');
-  if (hop2) {
-    ixs.push(label(hop2, 'hop2'));
-    labels.push('[swap] hop2');
-  }
-  if (hop3) {
-    ixs.push(label(hop3, 'hop3'));
-    labels.push('[swap] hop3');
-  }
-
-  const built = await buildAndMaybeLut(connection, payer.publicKey, payer, ixs, priFeeMicroLamports);
-  if ('lutAddressUsed' in built && built.lutAddressUsed) {
-    console.log('[lut] used', built.lutAddressUsed.toBase58());
-  }
-
-  const sim = await simulateWithLogs(connection, built, [payer]);
-  if (sim.value.err) {
-    console.error('[sim] err', sim.value.err);
-    if (sim.value.logs) {
-      console.error('[sim logs]');
-      sim.value.logs.forEach((l, i) => console.error(i.toString().padStart(2, '0'), l));
-    }
-    console.error('[ix index → label]');
-    labels.forEach((lab, idx) => console.error(idx, lab));
-    throw new Error('simulation failed');
-  }
-
-  const sig = await sendAndConfirmAny(connection, built, [payer]);
-  console.log('[send] sig', sig);
-}
-
 function allowedByHopCount(pathLen: number, lutExists: boolean) {
   if (pathLen <= CFG.maxHops) return true;
   if (pathLen === 3 && CFG.allowThirdHop && lutExists) return true;
@@ -206,42 +140,60 @@ async function main() {
           continue;
         }
 
-        if (swapIxs.length > 3) {
-          console.warn('[route] built more than 3 instructions, skipping for labeling helper', swapIxs.length);
-          continue;
-        }
-
+        let skipPostProcessing = false;
+        let skipTune = false;
         try {
-          await executeRoute(
+          // 👉 Build (legacy first, then v0/LUT if needed)
+          const built = await buildAndMaybeLut(
             sendConn,
+            wallet.publicKey,
             wallet,
-            swapIxs[0],
-            swapIxs[1],
-            swapIxs[2],
-            priorityFee,
+            swapIxs,
+            /* cuPrice */ priorityFee,      // micro-lamports per CU
+            /* cuLimit  */ CFG.cuLimit ?? 1_400_000
           );
-          cBundlesSent.inc(); sent++;
-          cBundlesOk.inc(); ok++; consecutiveFails = 0;
-        } catch (e) {
-          const err = e as Error;
-          if (err?.message === 'simulation failed') {
+
+          console.log('[route] instructions count =', swapIxs.length);
+          if ('lutAddressUsed' in built && built.lutAddressUsed) {
+            console.log('[lut] used', built.lutAddressUsed.toBase58());
+          }
+
+          // 👉 Simulate (always signed; gets logs)
+          const sim = await simulateWithLogs(sendConn, built, [wallet]);
+          if (sim.value.err) {
+            console.warn('[sim] failed:', sim.value.err);
+            sim.value.logs?.forEach((l, i) => console.warn(String(i).padStart(2, '0'), l));
             cSimFail.inc();
             consecutiveFails++;
-            console.warn('[sim] failed route', err);
-            if (CFG.haltOnNegativeSim) continue;
+            skipPostProcessing = true;
+            if (CFG.haltOnNegativeSim) {
+              skipTune = true;
+            }
           } else {
+            // 👉 Send
+            const sig = await sendAndConfirmAny(sendConn, built, [wallet]);
+            console.log('[send] success', sig);
             cBundlesSent.inc(); sent++;
-            cExecFail.inc();
-            consecutiveFails++;
-            console.error('[bundle/send] error', err);
+            cBundlesOk.inc(); ok++; consecutiveFails = 0;
+          }
+        } catch (e: any) {
+          cBundlesSent.inc(); sent++;
+          cExecFail.inc(); consecutiveFails++;
+          console.error('[send] error', e?.message ?? e);
+          skipPostProcessing = true;
+        }
+
+        if (!skipTune) {
+          tuneFee();
+          if (consecutiveFails >= CFG.maxConsecutiveFails) {
+            console.error(`[risk] ${consecutiveFails} consecutive fails → cooldown`);
+            await new Promise(r => setTimeout(r, 5000));
+            consecutiveFails = 0;
           }
         }
 
-        tuneFee();
-        if (consecutiveFails >= CFG.maxConsecutiveFails) {
-          console.error(`[risk] ${consecutiveFails} consecutive fails → cooldown`);
-          await new Promise(r => setTimeout(r, 5000));
-          consecutiveFails = 0;
+        if (skipPostProcessing) {
+          continue;
         }
       }
 

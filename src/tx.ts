@@ -1,13 +1,16 @@
 import {
+  ComputeBudgetProgram,
   Connection,
   PublicKey,
   Signer,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
 import { CFG } from './config.js';
-import { buildV0WithLut, ensureLutHas } from './lut.js';
+import { ensureLutHas } from './lut.js';
+import { sanitizeOnlyWalletSigns } from './txSanitize.js';
 
 let runtimeLutAddress: PublicKey | null = CFG.lutAddressEnv && CFG.lutAddressEnv.length > 0
   ? new PublicKey(CFG.lutAddressEnv)
@@ -16,53 +19,70 @@ let runtimeLutAddress: PublicKey | null = CFG.lutAddressEnv && CFG.lutAddressEnv
 export function getRuntimeLutAddress(): PublicKey | null {
   return runtimeLutAddress;
 }
-
 export function setRuntimeLutAddress(addr: PublicKey) {
   runtimeLutAddress = addr;
+}
+
+export function withComputeBudget(
+  ixs: TransactionInstruction[],
+  cuLimit?: number,
+  cuPriceMicroLamports?: number
+) {
+  const pre: TransactionInstruction[] = [];
+  if (cuLimit && cuLimit > 0) {
+    pre.push(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+  }
+  if (cuPriceMicroLamports && cuPriceMicroLamports > 0) {
+    pre.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: cuPriceMicroLamports }));
+  }
+  return [...pre, ...ixs];
 }
 
 export async function buildAndMaybeLut(
   connection: Connection,
   payer: PublicKey,
-  payerSigner: Signer, // Keypair (or compatible) that can sign LUT txs if needed
-  instructions: TransactionInstruction[],
-  cuPriceMicroLamports: number | undefined,
+  payerSigner: Signer, // Keypair
+  rawInstructions: TransactionInstruction[],
+  cuPriceMicroLamports?: number,
+  cuLimit?: number,
 ): Promise<
   | { kind: 'legacy'; tx: Transaction; lutAddressUsed?: PublicKey }
   | { kind: 'v0'; tx: VersionedTransaction; lutAddressUsed?: PublicKey }
 > {
-  // 1) Try legacy (fast path, minimal overhead)
+  // 0) sanitize signers
+  const sanitized = sanitizeOnlyWalletSigns(rawInstructions, payer);
+  const withCb = withComputeBudget(sanitized, cuLimit ?? CFG.cuLimit, cuPriceMicroLamports);
+
+  // 1) Try legacy first (fast path)
   try {
     const { blockhash } = await connection.getLatestBlockhash();
     const legacy = new Transaction();
     legacy.recentBlockhash = blockhash;
     legacy.feePayer = payer;
-    for (const ix of instructions) legacy.add(ix);
+    withCb.forEach(ix => legacy.add(ix));
 
-    // Quick “dry” serialization: if this throws, it’s too big
+    // serialize to ensure it fits; if too large, fallthrough to v0/LUT
     legacy.serialize({ requireAllSignatures: false, verifySignatures: false });
     return { kind: 'legacy', tx: legacy };
-  } catch (e) {
-    // too large → fall through to LUT/v0 path
+  } catch {
+    // too big → build v0 with LUT
   }
 
-  // 2) Build with LUT
-  // Collect **all** keys from instructions (accounts + programIds)
+  // 2) v0 with LUT (collect all accounts)
   const keySet = new Set<string>();
   const requiredKeys: PublicKey[] = [];
-  function addKey(k: PublicKey) {
+  function add(k: PublicKey) {
     const s = k.toBase58();
     if (!keySet.has(s)) {
       keySet.add(s);
       requiredKeys.push(k);
     }
   }
-  for (const ix of instructions) {
-    addKey(ix.programId);
-    for (const k of ix.keys) addKey(k.pubkey);
+  for (const ix of withCb) {
+    add(ix.programId);
+    for (const k of ix.keys) add(k.pubkey);
   }
 
-  // Resolve or create LUT
   const ensured = await ensureLutHas(
     connection,
     payer,
@@ -72,14 +92,15 @@ export async function buildAndMaybeLut(
   );
   runtimeLutAddress = ensured;
 
-  const txV0 = await buildV0WithLut({
-    connection,
-    payer,
-    lutAddress: ensured,
-    cuLimit: CFG.cuLimit,
-    cuPriceMicroLamports: cuPriceMicroLamports ?? 0,
-    instructions,
-  });
+  // Compile v0
+  const lutAcc = (await connection.getAddressLookupTable(ensured)).value;
+  if (!lutAcc) throw new Error('LUT not found on chain');
+  const { blockhash } = await connection.getLatestBlockhash();
+  const msg = new TransactionMessage({
+    payerKey: payer,
+    recentBlockhash: blockhash,
+    instructions: withCb,
+  }).compileToV0Message([lutAcc]);
 
-  return { kind: 'v0', tx: txV0, lutAddressUsed: ensured };
+  return { kind: 'v0', tx: new VersionedTransaction(msg), lutAddressUsed: ensured };
 }
