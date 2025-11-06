@@ -1,10 +1,11 @@
+// src/dex/meteoraDlmmAdapter.ts
 import { PublicKey, } from '@solana/web3.js';
 import BN from 'bn.js';
 import { NATIVE_MINT } from '@solana/spl-token';
-import { DLMM, SwapDirection } from '@meteora-ag/dlmm';
+import { createRequire } from 'module';
 import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
 // ───────────────────────────────────────────────────────────────────────────────
-// Config / small utils
+// Config / utils
 // ───────────────────────────────────────────────────────────────────────────────
 const DEBUG = process.env.DLMM_DEBUG === '1';
 function log(...args) {
@@ -15,102 +16,133 @@ function toPk(value, label) {
     if (typeof value !== 'string' || value.trim() === '') {
         throw new Error(`${label} is empty or not a string: ${String(value)}`);
     }
-    const s = value.trim();
     try {
-        return new PublicKey(s);
+        return new PublicKey(value.trim());
     }
     catch {
-        throw new Error(`${label} is not a valid Solana public key: '${s}'`);
+        throw new Error(`${label} is not a valid public key: '${value}'`);
     }
 }
 function assert(condition, msg) {
     if (!condition)
         throw new Error(msg);
 }
-// ───────────────────────────────────────────────────────────────────────────────
-// Simple pool cache (avoid reloading DLMM state every call)
-// ───────────────────────────────────────────────────────────────────────────────
+const require = createRequire(import.meta.url);
 const dlmmCache = new Map();
+let cachedSdk = null;
+function loadSdk() {
+    if (cachedSdk)
+        return cachedSdk;
+    const candidates = [
+        '@meteora-ag/dlmm/dist/cjs/index.js',
+        '@meteora-ag/dlmm/dist/cjs',
+        '@meteora-ag/dlmm',
+    ];
+    for (const id of candidates) {
+        try {
+            const mod = require(id);
+            cachedSdk = mod?.default ?? mod;
+            return cachedSdk;
+        }
+        catch (err) {
+            if (DEBUG)
+                log('failed to load DLMM SDK candidate', id, err);
+        }
+    }
+    throw new Error(`Unable to load Meteora DLMM SDK. Tried candidates: ${candidates.join(', ')}`);
+}
 async function loadDlmm(connection, poolPk) {
     const k = poolPk.toBase58();
     const cached = dlmmCache.get(k);
     if (cached)
         return cached;
-    const dlmm = await DLMM.create(connection, poolPk);
-    dlmmCache.set(k, dlmm);
-    return dlmm;
+    // Most versions expose: `const pool = await DLMM.create(connection, poolPk)`
+    const sdk = loadSdk();
+    const pool = await sdk.create(connection, poolPk);
+    dlmmCache.set(k, pool);
+    return pool;
+}
+/** Map input/output mints to the SDK's boolean direction (`isXtoY`). */
+function resolveDirectionBool(dlmm, inMint, outMint) {
+    // Most SDK builds expose either `tokenX/tokenY.publicKey` OR `state.mintX/mintY`
+    const tokenX = dlmm?.tokenX?.publicKey ?? dlmm?.state?.mintX ?? dlmm?.state?.mintA;
+    const tokenY = dlmm?.tokenY?.publicKey ?? dlmm?.state?.mintY ?? dlmm?.state?.mintB;
+    if (!tokenX || !tokenY)
+        return null;
+    if (inMint.equals(tokenX) && outMint.equals(tokenY))
+        return true; // X -> Y
+    if (inMint.equals(tokenY) && outMint.equals(tokenX))
+        return false; // Y -> X
+    return null;
 }
 // ───────────────────────────────────────────────────────────────────────────────
-// Factory
-// NOTE: we capture a Connection so we can use the SDK inside quote/swap.
-// Update your builder to pass the read connection into this factory.
+// Factory (requires a Connection)
 // ───────────────────────────────────────────────────────────────────────────────
 export function makeMeteoraEdge(connection, poolId, inputMint, outputMint) {
     const poolPk = toPk(poolId, 'DLMM pool id');
-    const inMintPk = toPk(inputMint, 'inputMint');
-    const outMintPk = toPk(outputMint, 'outputMint');
+    const inMintPk = toPk(inputMint, 'input mint');
+    const outMintPk = toPk(outputMint, 'output mint');
     return {
         id: `meteora:${poolPk.toBase58()}`,
         from: inMintPk.toBase58(),
         to: outMintPk.toBase58(),
         feeBps: 0,
-        // Real quote via SDK (respects bins/liquidity)
+        // --- Quote ---
         async quoteOut(amountIn) {
             if (amountIn <= 0n)
                 return 0n;
             const dlmm = await loadDlmm(connection, poolPk);
-            const mintA = dlmm.state.mintA;
-            const mintB = dlmm.state.mintB;
-            let direction;
-            if (inMintPk.equals(mintA) && outMintPk.equals(mintB)) {
-                direction = SwapDirection.AtoB;
-            }
-            else if (inMintPk.equals(mintB) && outMintPk.equals(mintA)) {
-                direction = SwapDirection.BtoA;
-            }
-            else {
-                // Pool doesn’t match requested pair; return 0 to drop this edge for this path.
-                if (DEBUG) {
+            const dir = resolveDirectionBool(dlmm, inMintPk, outMintPk);
+            if (dir === null) {
+                if (DEBUG)
                     log('quoteOut: mint mismatch', {
                         pool: poolPk.toBase58(),
-                        poolMintA: mintA.toBase58(),
-                        poolMintB: mintB.toBase58(),
                         in: inMintPk.toBase58(),
                         out: outMintPk.toBase58(),
                     });
-                }
                 return 0n;
             }
-            const quote = await dlmm.swapQuoteByInputToken(new BN(amountIn.toString()), direction);
-            const out = BigInt(quote.amountOut.toString());
+            const bnIn = new BN(amountIn.toString());
+            // Prefer newer API if available
+            if (typeof dlmm.swapQuoteByInputToken === 'function') {
+                // Newer SDKs: `swapQuoteByInputToken(amountInBN, isXtoY)`
+                const q = await dlmm.swapQuoteByInputToken(bnIn, dir);
+                const out = BigInt(q.amountOut.toString());
+                if (DEBUG)
+                    log('quoteOut:newAPI', { isXtoY: dir, amountIn: amountIn.toString(), amountOut: out.toString() });
+                return out > 0n ? out : 0n;
+            }
+            // Fallback: bin-array route + exact-in quote
+            const BinAPI = loadSdk();
+            if (typeof BinAPI.getBinArrayForSwap !== 'function') {
+                if (DEBUG)
+                    log('quoteOut: no supported quote method on this SDK build');
+                return 0n;
+            }
+            const binArrays = await BinAPI.getBinArrayForSwap(connection, poolPk, dir);
+            if (typeof dlmm.swapQuoteExactIn !== 'function') {
+                if (DEBUG)
+                    log('quoteOut: missing swapQuoteExactIn on SDK build');
+                return 0n;
+            }
+            // Signature seen in examples: swapQuoteExactIn(amountIn, isXtoY, treeLevel, binArrays, slippage)
+            const q = await dlmm.swapQuoteExactIn(bnIn, dir, 1, binArrays, 0);
+            const out = BigInt(q.amountOut.toString());
             if (DEBUG)
-                log('quoteOut ok', {
-                    pool: poolPk.toBase58(),
-                    dir: direction === SwapDirection.AtoB ? 'AtoB' : 'BtoA',
-                    amountIn: amountIn.toString(),
-                    amountOut: out.toString(),
-                });
-            return out;
+                log('quoteOut:legacyAPI', { isXtoY: dir, amountIn: amountIn.toString(), amountOut: out.toString() });
+            return out > 0n ? out : 0n;
         },
-        // Build the real DLMM swap ix(s) via SDK
+        // --- Build swap instruction(s) ---
         async buildSwapIx(amountIn, minOut, user) {
             assert(amountIn > 0n, 'amountIn must be > 0');
             assert(minOut >= 0n, 'minOut must be >= 0');
             const dlmm = await loadDlmm(connection, poolPk);
-            const mintA = dlmm.state.mintA;
-            const mintB = dlmm.state.mintB;
-            let direction;
-            if (inMintPk.equals(mintA) && outMintPk.equals(mintB)) {
-                direction = SwapDirection.AtoB;
-            }
-            else if (inMintPk.equals(mintB) && outMintPk.equals(mintA)) {
-                direction = SwapDirection.BtoA;
-            }
-            else {
+            const dir = resolveDirectionBool(dlmm, inMintPk, outMintPk);
+            if (dir === null) {
                 throw new Error('DLMM pool does not match input/output mints');
             }
+            // Prep ATAs & wrap WSOL (input)
             const setupIxs = [];
-            // Ensure ATAs / wrap WSOL on the *input* side
             let sourceAta;
             if (inMintPk.equals(NATIVE_MINT)) {
                 const wrapped = wrapSolIntoAta(user, user, amountIn);
@@ -122,40 +154,86 @@ export function makeMeteoraEdge(connection, poolId, inputMint, outputMint) {
                 setupIxs.push(...ensured.ixs);
                 sourceAta = ensured.ata;
             }
-            // Ensure output ATA exists
             const ensuredDst = ensureAtaIx(user, user, outMintPk);
             setupIxs.push(...ensuredDst.ixs);
             const destinationAta = ensuredDst.ata;
-            // Quote again for safety (and for consistent bins) then enforce minOut
-            const quote = await dlmm.swapQuoteByInputToken(new BN(amountIn.toString()), direction);
-            const expectedOut = BigInt(quote.amountOut.toString());
-            if (expectedOut < minOut) {
-                throw new Error(`DLMM quote below minOut: got ${expectedOut}, need >= ${minOut}`);
+            const bnIn = new BN(amountIn.toString());
+            const bnMin = new BN(minOut.toString());
+            // Try newer swap API first (minAmountOut supported)
+            if (typeof dlmm.swap === 'function') {
+                // Many builds accept: { owner, isXtoY, amountIn, minAmountOut, tokenAccountIn, tokenAccountOut }
+                // Some also require: tokenIn, tokenOut (mints). Pass when available; harmless otherwise.
+                const args = {
+                    owner: user,
+                    isXtoY: dir,
+                    amountIn: bnIn,
+                    minAmountOut: bnMin,
+                    tokenAccountIn: sourceAta,
+                    tokenAccountOut: destinationAta,
+                    tokenIn: inMintPk,
+                    tokenOut: outMintPk,
+                };
+                // Some older builds require bin arrays in swap call; supply if needed.
+                const sdk = loadSdk();
+                if (typeof sdk.getBinArrayForSwap === 'function') {
+                    try {
+                        const binArrays = await sdk.getBinArrayForSwap(connection, poolPk, dir);
+                        args.binArrays = binArrays;
+                    }
+                    catch {
+                        // ignore; not all versions need this
+                    }
+                }
+                const { innerTransaction } = await dlmm.swap(args);
+                const ixs = (innerTransaction?.instructions ?? []);
+                if (DEBUG) {
+                    log('buildSwapIx:newAPI', {
+                        isXtoY: dir,
+                        ixs: ixs.length,
+                        src: sourceAta.toBase58(),
+                        dst: destinationAta.toBase58(),
+                        amountIn: amountIn.toString(),
+                        minOut: minOut.toString(),
+                    });
+                }
+                return { ixs: [...setupIxs, ...ixs] };
             }
-            // Build real DLMM swap via SDK
+            // Fallback path: legacy quote + swap
+            const BinAPI = loadSdk();
+            assert(typeof BinAPI.getBinArrayForSwap === 'function', 'DLMM SDK missing getBinArrayForSwap');
+            const binArrays = await BinAPI.getBinArrayForSwap(connection, poolPk, dir);
+            // Older builds: swap(...) may use { owner, isXtoY, amount, slippage, tokenAccountIn, tokenAccountOut, binArrays }
+            // Enforce minOut by recomputing quote here (defensive)
+            if (typeof dlmm.swapQuoteExactIn === 'function') {
+                const q = await dlmm.swapQuoteExactIn(bnIn, dir, 1, binArrays, 0);
+                const expectedOut = BigInt(q.amountOut.toString());
+                if (expectedOut < minOut) {
+                    throw new Error(`DLMM quote below minOut: got ${expectedOut}, need >= ${minOut}`);
+                }
+            }
             const { innerTransaction } = await dlmm.swap({
                 owner: user,
-                direction,
-                amountIn: new BN(amountIn.toString()),
-                minAmountOut: new BN(minOut.toString()),
-                // The SDK resolves vaults, bin arrays, token program, etc.
-                // We’ve created/wrapped user ATAs above; DLMM swap will read/write them.
+                isXtoY: dir,
+                amount: bnIn,
+                slippage: 0,
+                tokenAccountIn: sourceAta,
+                tokenAccountOut: destinationAta,
+                binArrays,
+                tokenIn: inMintPk,
+                tokenOut: outMintPk,
             });
-            const dlmmIxs = innerTransaction.instructions;
+            const ixs = (innerTransaction?.instructions ?? []);
             if (DEBUG) {
-                log('buildSwapIx', {
-                    pool: poolPk.toBase58(),
-                    dir: direction === SwapDirection.AtoB ? 'AtoB' : 'BtoA',
-                    ixs: dlmmIxs.length,
+                log('buildSwapIx:legacyAPI', {
+                    isXtoY: dir,
+                    ixs: ixs.length,
+                    src: sourceAta.toBase58(),
+                    dst: destinationAta.toBase58(),
                     amountIn: amountIn.toString(),
                     minOut: minOut.toString(),
-                    expectedOut: expectedOut.toString(),
-                    sourceAta: sourceAta.toBase58(),
-                    destinationAta: destinationAta.toBase58(),
                 });
             }
-            // Return prep + DLMM swap ixs (no SystemProgram/Allocate hack here!)
-            return { ixs: [...setupIxs, ...dlmmIxs] };
+            return { ixs: [...setupIxs, ...ixs] };
         },
     };
 }
