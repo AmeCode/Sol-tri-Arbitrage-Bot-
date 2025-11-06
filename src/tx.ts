@@ -27,7 +27,10 @@ export async function buildAndMaybeLut(
   payerSigner: Signer, // Keypair (or compatible) that can sign LUT txs if needed
   instructions: TransactionInstruction[],
   cuPriceMicroLamports: number | undefined,
-): Promise<{ tx: Transaction | VersionedTransaction; lutAddressUsed?: PublicKey }> {
+): Promise<
+  | { kind: 'legacy'; tx: Transaction; lutAddressUsed?: PublicKey }
+  | { kind: 'v0'; tx: VersionedTransaction; lutAddressUsed?: PublicKey }
+> {
   // 1) Try legacy (fast path, minimal overhead)
   try {
     const { blockhash } = await connection.getLatestBlockhash();
@@ -38,7 +41,7 @@ export async function buildAndMaybeLut(
 
     // Quick “dry” serialization: if this throws, it’s too big
     legacy.serialize({ requireAllSignatures: false, verifySignatures: false });
-    return { tx: legacy };
+    return { kind: 'legacy', tx: legacy };
   } catch (e) {
     // too large → fall through to LUT/v0 path
   }
@@ -78,5 +81,5 @@ export async function buildAndMaybeLut(
     instructions,
   });
 
-  return { tx: txV0, lutAddressUsed: ensured };
+  return { kind: 'v0', tx: txV0, lutAddressUsed: ensured };
 }

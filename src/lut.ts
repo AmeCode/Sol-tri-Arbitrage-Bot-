@@ -1,6 +1,5 @@
 import {
   AddressLookupTableProgram,
-  ComputeBudgetProgram,
   Connection,
   PublicKey,
   sendAndConfirmTransaction,
@@ -74,15 +73,7 @@ export async function buildV0WithLut(params: {
   cuPriceMicroLamports?: number;
   instructions: TransactionInstruction[];
 }) {
-  const { connection, payer, lutAddress, cuLimit, cuPriceMicroLamports, instructions } = params;
-  const prelude: TransactionInstruction[] = [];
-  if (cuLimit && cuLimit > 0) {
-    prelude.push(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
-  }
-  if (cuPriceMicroLamports && cuPriceMicroLamports > 0) {
-    prelude.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: cuPriceMicroLamports }));
-  }
-
+  const { connection, payer, lutAddress, instructions } = params;
   const lutAcc = (await connection.getAddressLookupTable(lutAddress)).value;
   if (!lutAcc) throw new Error('LUT not found on chain');
 
@@ -90,7 +81,7 @@ export async function buildV0WithLut(params: {
   const msg = new TransactionMessage({
     payerKey: payer,
     recentBlockhash: blockhash,
-    instructions: [...prelude, ...instructions],
+    instructions,
   }).compileToV0Message([lutAcc]);
 
   return new VersionedTransaction(msg);
