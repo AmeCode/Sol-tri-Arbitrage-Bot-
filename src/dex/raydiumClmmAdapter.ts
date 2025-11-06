@@ -1,6 +1,6 @@
-import { PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import { rayIndex } from '../initRay.js';
-import { PoolEdge } from '../graph/types.js';
+import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { isTradable, normMintA, normMintB } from '../ray/clmmIndex.js';
 
 export function makeRayClmmEdge(poolId: string, mintA: string, mintB: string): PoolEdge {
@@ -73,7 +73,11 @@ export function makeRayClmmEdge(poolId: string, mintA: string, mintB: string): P
       return amountIn;
     },
 
-    async buildSwapIx(_amountIn: bigint, _minOut: bigint, _user: PublicKey): Promise<TransactionInstruction[]> {
+    async buildSwapIx(
+      _amountIn: bigint,
+      _minOut: bigint,
+      _user: PublicKey,
+    ): Promise<SwapInstructionBundle> {
       const id = await resolvePoolId();
       throw new Error(`raydium: buildSwapIx not implemented for ${id}`);
     }

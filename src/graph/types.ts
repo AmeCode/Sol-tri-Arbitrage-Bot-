@@ -1,9 +1,14 @@
-import { PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { Keypair, PublicKey, TransactionInstruction } from '@solana/web3.js';
 
 /**
  * A mint address on Solana. Mints are represented by their string public key.
  */
 export type Mint = string;
+
+export interface SwapInstructionBundle {
+  ixs: TransactionInstruction[];
+  extraSigners?: Keypair[];
+}
 
 export interface PoolEdge {
   /** Unique identifier for this edge (e.g. dex:poolId) */
@@ -28,6 +33,10 @@ export interface PoolEdge {
    * @param minOut minimum acceptable output amount
    * @param user payer public key
    */
-  buildSwapIx(amountIn: bigint, minOut: bigint, user: PublicKey): Promise<TransactionInstruction[]>;
+  buildSwapIx(
+    amountIn: bigint,
+    minOut: bigint,
+    user: PublicKey,
+  ): Promise<SwapInstructionBundle>;
 }
 

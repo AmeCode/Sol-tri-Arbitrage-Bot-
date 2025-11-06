@@ -10,7 +10,7 @@ import {
 } from '@solana/web3.js';
 import { CFG } from './config.js';
 import { ensureLutHas } from './lut.js';
-import { sanitizeOnlyWalletSigns } from './txSanitize.js';
+import { sanitizeWithSignerWhitelist } from './txSanitize.js';
 
 let runtimeLutAddress: PublicKey | null = CFG.lutAddressEnv && CFG.lutAddressEnv.length > 0
   ? new PublicKey(CFG.lutAddressEnv)
@@ -45,12 +45,13 @@ export async function buildAndMaybeLut(
   rawInstructions: TransactionInstruction[],
   cuPriceMicroLamports?: number,
   cuLimit?: number,
+  extraSignerPubkeys: PublicKey[] = [],
 ): Promise<
   | { kind: 'legacy'; tx: Transaction; lutAddressUsed?: PublicKey }
   | { kind: 'v0'; tx: VersionedTransaction; lutAddressUsed?: PublicKey }
 > {
-  // 0) sanitize signers
-  const sanitized = sanitizeOnlyWalletSigns(rawInstructions, payer);
+  const allowed = new Set(extraSignerPubkeys.map(k => k.toBase58()));
+  const sanitized = sanitizeWithSignerWhitelist(rawInstructions, payer, allowed);
   const withCb = withComputeBudget(sanitized, cuLimit ?? CFG.cuLimit, cuPriceMicroLamports);
 
   // 1) Try legacy first (fast path)

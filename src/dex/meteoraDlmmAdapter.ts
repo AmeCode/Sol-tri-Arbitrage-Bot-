@@ -1,5 +1,5 @@
 import { PublicKey, TransactionInstruction, SystemProgram } from '@solana/web3.js';
-import { PoolEdge } from '../graph/types.js';
+import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 
 /**
  * METEORA DLMM (lightweight) adapter with:
@@ -153,7 +153,11 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
      * Build swap ixs with clear validation + debug output.
      * Replace with the official SDK’s builder to get the full account metas.
      */
-    async buildSwapIx(amountIn: bigint, minOut: bigint, user: PublicKey): Promise<TransactionInstruction[]> {
+    async buildSwapIx(
+      amountIn: bigint,
+      minOut: bigint,
+      user: PublicKey,
+    ): Promise<SwapInstructionBundle> {
       assert(user instanceof PublicKey, 'user must be a PublicKey');
       log('buildSwapIx()', {
         user: user.toBase58(),
@@ -175,7 +179,7 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
         minOut,
       });
 
-      return [ix];
+      return { ixs: [ix] };
     },
   };
 }

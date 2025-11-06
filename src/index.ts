@@ -126,12 +126,16 @@ async function main() {
 
         console.log('[send] building tx...');
         const swapIxs: TransactionInstruction[] = [];
+        const extraSigners: Keypair[] = [];
         let amountIn = sized.inAmount;
         for (let i = 0; i < path.length; i++) {
           const edge = path[i];
           const minOut = hopQuotes[i];
-          const ixSet = await edge.buildSwapIx(amountIn, minOut, wallet.publicKey);
-          swapIxs.push(...ixSet);
+          const result = await edge.buildSwapIx(amountIn, minOut, wallet.publicKey);
+          swapIxs.push(...result.ixs);
+          if (result.extraSigners?.length) {
+            extraSigners.push(...result.extraSigners);
+          }
           amountIn = minOut;
         }
 
@@ -150,7 +154,8 @@ async function main() {
             wallet,
             swapIxs,
             /* cuPrice */ priorityFee,      // micro-lamports per CU
-            /* cuLimit  */ CFG.cuLimit ?? 1_400_000
+            /* cuLimit  */ CFG.cuLimit ?? 1_400_000,
+            /* extraSignerPubkeys */ extraSigners.map(k => k.publicKey),
           );
 
           console.log('[route] instructions count =', swapIxs.length);
@@ -159,7 +164,7 @@ async function main() {
           }
 
           // 👉 Simulate (always signed; gets logs)
-          const sim = await simulateWithLogs(sendConn, built, [wallet]);
+          const sim = await simulateWithLogs(sendConn, built, [wallet, ...extraSigners]);
           if (sim.value.err) {
             console.warn('[sim] failed:', sim.value.err);
             sim.value.logs?.forEach((l, i) => console.warn(String(i).padStart(2, '0'), l));
@@ -171,7 +176,7 @@ async function main() {
             }
           } else {
             // 👉 Send
-            const sig = await sendAndConfirmAny(sendConn, built, [wallet]);
+            const sig = await sendAndConfirmAny(sendConn, built, [wallet, ...extraSigners]);
             console.log('[send] success', sig);
             cBundlesSent.inc(); sent++;
             cBundlesOk.inc(); ok++; consecutiveFails = 0;

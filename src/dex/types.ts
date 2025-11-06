@@ -1,4 +1,5 @@
-import { PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
+import type { SwapInstructionBundle } from '../graph/types.js';
 
 export interface DexAdapterEdge {
   id: string;
@@ -6,5 +7,9 @@ export interface DexAdapterEdge {
   to: string;
   feeBps: number;
   quoteOut(amountIn: bigint): Promise<bigint>;
-  buildSwapIx(amountIn: bigint, minOut: bigint, user: PublicKey): Promise<TransactionInstruction[]>;
+  buildSwapIx(
+    amountIn: bigint,
+    minOut: bigint,
+    user: PublicKey,
+  ): Promise<SwapInstructionBundle>;
 }

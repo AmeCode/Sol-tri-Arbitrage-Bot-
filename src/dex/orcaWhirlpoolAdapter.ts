@@ -8,7 +8,7 @@ import {
 } from '@orca-so/whirlpools-sdk';
 import { Percentage } from '@orca-so/common-sdk';
 import BN from 'bn.js';
-import { PoolEdge } from '../graph/types.js';
+import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { CFG } from '../config.js';
 
 export function makeOrcaEdge(
@@ -50,7 +50,11 @@ export function makeOrcaEdge(
       return BigInt(quote.estimatedAmountOut.toString());
     },
 
-    async buildSwapIx(amountIn: bigint, _minOut: bigint, _user: PublicKey): Promise<TransactionInstruction[]> {
+    async buildSwapIx(
+      amountIn: bigint,
+      _minOut: bigint,
+      _user: PublicKey,
+    ): Promise<SwapInstructionBundle> {
       const pool = await client.getPool(poolPk);
       const inputMint = getInputMint(this.from);
       const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
@@ -67,7 +71,7 @@ export function makeOrcaEdge(
       );
 
       const tb = await pool.swap(quote);
-      return tb.compressIx(false).instructions;
+      return { ixs: tb.compressIx(false).instructions };
     }
   };
 }
