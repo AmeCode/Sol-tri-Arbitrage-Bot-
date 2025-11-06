@@ -3,6 +3,11 @@ import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { NATIVE_MINT } from '@solana/spl-token';
 import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
 
+export enum MeteoraSwapDirection {
+  AtoB = 'AtoB',
+  BtoA = 'BtoA',
+}
+
 /**
  * METEORA DLMM (lightweight) adapter with:
  * - Strong input validation (PublicKey strings, amounts)
@@ -84,6 +89,7 @@ function encodeDlmmSwap(params: {
   minOut: bigint;
   sourceTokenAccount: PublicKey;
   destinationTokenAccount: PublicKey;
+  direction: MeteoraSwapDirection;
 }): TransactionInstruction {
   // Sanity checks
   assert(!params.inputMint.equals(params.outputMint), 'inputMint and outputMint must differ');
@@ -115,6 +121,7 @@ function encodeDlmmSwap(params: {
     outputMint: params.outputMint.toBase58(),
     amountIn: params.amountIn.toString(),
     minOut: params.minOut.toString(),
+    direction: params.direction,
     keys: describeKeys(keys),
     dataHex: data.toString('hex'),
   });
@@ -130,13 +137,18 @@ function encodeDlmmSwap(params: {
 // Public API
 // ───────────────────────────────────────────────────────────────────────────────
 
-export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: string): PoolEdge {
+export function makeMeteoraEdge(
+  poolId: string,
+  inputMint: string,
+  outputMint: string,
+  direction: MeteoraSwapDirection,
+): PoolEdge {
   const poolPk   = toPk(poolId, 'DLMM pool id');
   const inMintPk = toPk(inputMint, 'inputMint');
   const outMintPk= toPk(outputMint, 'outputMint');
 
   return {
-    id: `meteora:${poolPk.toBase58()}`,
+    id: `meteora:${poolPk.toBase58()}:${direction}`,
     from: inMintPk.toBase58(),
     to: outMintPk.toBase58(),
     feeBps: 0,
@@ -151,6 +163,7 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
         from: inMintPk.toBase58(),
         to: outMintPk.toBase58(),
         amountIn: amountIn.toString(),
+        direction,
       });
       return amountIn;
     },
@@ -173,6 +186,7 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
         amountIn: amountIn.toString(),
         minOut: minOut.toString(),
         programId: DLMM_PROGRAM_ID.toBase58(),
+        direction,
       });
 
       const setupIxs: TransactionInstruction[] = [];
@@ -202,6 +216,7 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
         minOut,
         sourceTokenAccount: sourceAta,
         destinationTokenAccount: destinationAta,
+        direction,
       });
 
       return { ixs: [...setupIxs, ix] };
