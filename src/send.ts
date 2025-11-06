@@ -5,8 +5,9 @@ import {
   Transaction,
   VersionedTransaction,
 } from '@solana/web3.js';
+import { CFG } from './config.js';
 
-export type BuiltTx =
+type BuiltTx =
   | { kind: 'legacy'; tx: Transaction }
   | { kind: 'v0'; tx: VersionedTransaction };
 
@@ -15,20 +16,35 @@ export async function simulateWithLogs(
   built: BuiltTx,
   signers: Signer[],
 ) {
+  if (CFG.debugSim) console.log('[sim] starting simulateWithLogs… kind=', built.kind);
+
   try {
     if (built.kind === 'legacy') {
-      const tx = built.tx;
-      // simulate accepts (legacy) partially signed; signers not required for sim
-      const sim = await connection.simulateTransaction(tx, signers);
+      const sim = await connection.simulateTransaction(built.tx, signers);
+      if (CFG.debugSim) {
+        console.log('[sim] legacy result err=', sim.value.err);
+        if (sim.value.logs) {
+          console.log('[sim logs]');
+          sim.value.logs.forEach((l, i) => console.log(String(i).padStart(2, '0'), l));
+        }
+      }
       return sim;
     } else {
-      // Versioned: must be signed before simulateTransaction in some node/web3 combos
+      // Versioned must be signed for some RPC/node combos to return logs
       const tx = built.tx;
       tx.sign(signers as Keypair[]);
       const sim = await connection.simulateTransaction(tx, { sigVerify: true });
+      if (CFG.debugSim) {
+        console.log('[sim] v0 result err=', sim.value.err);
+        if (sim.value.logs) {
+          console.log('[sim logs]');
+          sim.value.logs.forEach((l, i) => console.log(String(i).padStart(2, '0'), l));
+        }
+      }
       return sim;
     }
   } catch (e: any) {
+    console.error('[sim] threw:', e?.message ?? e);
     throw e;
   }
 }
@@ -38,16 +54,17 @@ export async function sendAndConfirmAny(
   built: BuiltTx,
   signers: Signer[],
 ) {
+  if (CFG.debugSim) console.log('[send] sending kind=', built.kind);
+
   if (built.kind === 'legacy') {
-    // web3 will sign using provided signers internally
     const sig = await connection.sendTransaction(built.tx, signers, {
       skipPreflight: false,
       preflightCommitment: 'confirmed',
     });
     await connection.confirmTransaction(sig, 'confirmed');
+    console.log('[send] sig', sig);
     return sig;
   } else {
-    // Versioned must be signed explicitly
     const tx = built.tx;
     tx.sign(signers as Keypair[]);
     const sig = await connection.sendRawTransaction(tx.serialize(), {
@@ -55,6 +72,7 @@ export async function sendAndConfirmAny(
       preflightCommitment: 'confirmed',
     });
     await connection.confirmTransaction(sig, 'confirmed');
+    console.log('[send] sig', sig);
     return sig;
   }
 }

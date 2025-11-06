@@ -42,6 +42,8 @@ export const CFG = {
   walletSecret: req('WALLET_SECRET'),
   jitoUrl: req('BLOCK_ENGINE_URL'),
   metricsPort: Number(process.env.METRICS_PORT ?? 9102),
+  raydiumApiBase: process.env.RAYDIUM_API_BASE ?? 'https://api-v3.raydium.io',
+
 
   tokensUniverse: (process.env.TOKENS ?? '')
     .split(',')
@@ -72,8 +74,10 @@ export const CFG = {
   maxSlippageBps: 20,
   maxHops: Number(process.env.MAX_HOPS ?? 2),
   allowThirdHop: String(process.env.ALLOW_THIRD_HOP ?? 'true') === 'true',
-  cuLimit: Number(process.env.CU_LIMIT ?? 1_400_000),
   lutAddressEnv: process.env.LUT_ADDRESS ?? '',
+  debugSim: String(process.env.DEBUG_SIM ?? 'true') === 'true',
+  cuLimit: Number(process.env.CU_LIMIT ?? 1_000_000),
+  cuPriceMicroLamports: Number(process.env.CU_PRICE_MICROLAMPORTS ?? 0),
 };
 
 // Optional: one-time sanity logs

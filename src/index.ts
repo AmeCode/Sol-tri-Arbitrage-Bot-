@@ -7,74 +7,8 @@ import { startMetrics, cBundlesOk, cBundlesSent, cSimFail, cExecFail, gIncludeRa
 import { Keypair, PublicKey, Connection, TransactionInstruction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { ensureLutHas } from './lut.js';
-import { buildAndMaybeLut, getRuntimeLutAddress, setRuntimeLutAddress } from './tx.js';
-import { sendAndConfirmAny, simulateWithLogs } from './send.js';
-
-function label(ix: TransactionInstruction, _label: string): TransactionInstruction {
-  return ix;
-}
-
-export async function executeRoute(
-  connection: Connection,
-  payer: Keypair,
-  hop1: TransactionInstruction,
-  hop2?: TransactionInstruction,
-  hop3?: TransactionInstruction,
-  priFeeMicroLamports?: number,
-) {
-  const prelude: TransactionInstruction[] = [];
-  if (CFG.cuLimit > 0) {
-    prelude.push(
-      // @ts-ignore
-      (await import('@solana/web3.js')).ComputeBudgetProgram.setComputeUnitLimit({ units: CFG.cuLimit }),
-    );
-  }
-  if ((priFeeMicroLamports ?? 0) > 0) {
-    prelude.push(
-      // @ts-ignore
-      (await import('@solana/web3.js')).ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priFeeMicroLamports! }),
-    );
-  }
-
-  const labels: string[] = [];
-  const ixs: TransactionInstruction[] = [];
-
-  for (const ix of prelude) {
-    ixs.push(ix);
-    labels.push('[prelude] compute');
-  }
-
-  ixs.push(label(hop1, 'hop1'));
-  labels.push('[swap] hop1');
-  if (hop2) {
-    ixs.push(label(hop2, 'hop2'));
-    labels.push('[swap] hop2');
-  }
-  if (hop3) {
-    ixs.push(label(hop3, 'hop3'));
-    labels.push('[swap] hop3');
-  }
-
-  const built = await buildAndMaybeLut(connection, payer.publicKey, payer, ixs, priFeeMicroLamports);
-  if ('lutAddressUsed' in built && built.lutAddressUsed) {
-    console.log('[lut] used', built.lutAddressUsed.toBase58());
-  }
-
-  const sim = await simulateWithLogs(connection, built, [payer]);
-  if (sim.value.err) {
-    console.error('[sim] err', sim.value.err);
-    if (sim.value.logs) {
-      console.error('[sim logs]');
-      sim.value.logs.forEach((l, i) => console.error(i.toString().padStart(2, '0'), l));
-    }
-    console.error('[ix index → label]');
-    labels.forEach((lab, idx) => console.error(idx, lab));
-    throw new Error('simulation failed');
-  }
-
-  const sig = await sendAndConfirmAny(connection, built, [payer]);
-  console.log('[send] sig', sig);
-}
+import { getRuntimeLutAddress, setRuntimeLutAddress } from './tx.js';
+import { executeRoute } from './executeRoute.js';
 
 function allowedByHopCount(pathLen: number, lutExists: boolean) {
   if (pathLen <= CFG.maxHops) return true;
@@ -206,24 +140,18 @@ async function main() {
           continue;
         }
 
-        if (swapIxs.length > 3) {
-          console.warn('[route] built more than 3 instructions, skipping for labeling helper', swapIxs.length);
-          continue;
-        }
-
         try {
-          await executeRoute(
+          const sig = await executeRoute(
             sendConn,
             wallet,
-            swapIxs[0],
-            swapIxs[1],
-            swapIxs[2],
+            swapIxs,
             priorityFee,
           );
+          console.log('[bundle/send] success', sig);
           cBundlesSent.inc(); sent++;
           cBundlesOk.inc(); ok++; consecutiveFails = 0;
         } catch (e) {
-          const err = e as Error;
+          const err = e as Error & { getLogs?: () => Promise<string[] | null> };
           if (err?.message === 'simulation failed') {
             cSimFail.inc();
             consecutiveFails++;
@@ -233,7 +161,18 @@ async function main() {
             cBundlesSent.inc(); sent++;
             cExecFail.inc();
             consecutiveFails++;
-            console.error('[bundle/send] error', err);
+            console.error('[bundle/send] error', err?.message ?? err);
+            if (typeof err?.getLogs === 'function') {
+              try {
+                const logs = await err.getLogs();
+                if (logs && logs.length > 0) {
+                  console.error('[send logs]');
+                  logs.forEach((l, i) => console.error(String(i).padStart(2, '0'), l));
+                }
+              } catch (logErr) {
+                console.error('[send logs] failed to fetch logs', (logErr as Error)?.message ?? logErr);
+              }
+            }
           }
         }
 

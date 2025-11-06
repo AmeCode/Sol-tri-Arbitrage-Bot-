@@ -90,8 +90,8 @@ export async function buildEdges(): Promise<PoolEdge[]> {
     const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
     const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
-      { ...makeRayClmmEdge(p.id, fromMint, toMint), from: fromMint, to: toMint },
-      { ...makeRayClmmEdge(p.id, fromMint, toMint), from: toMint, to: fromMint }
+      makeRayClmmEdge({ poolId: p.id, aMint: fromMint, bMint: toMint, side: 'AtoB', connection: read }),
+      makeRayClmmEdge({ poolId: p.id, aMint: fromMint, bMint: toMint, side: 'BtoA', connection: read }),
     );
   }
 
