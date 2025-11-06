@@ -26,6 +26,31 @@ export async function executeRoute(
     console.log('[route] instructions count =', allInstructions.length);
   }
 
+  // The bot only controls the trader wallet. If any downstream instruction
+  // requires another signer (e.g. a temporary wrap account produced by an
+  // aggregator payload) we will never be able to authorize it, so detect that
+  // early and bail out instead of submitting a transaction that will always
+  // fail with MissingRequiredSignature.
+  const unsupportedSignerKeys = new Set<string>();
+  for (const ix of allInstructions) {
+    for (const meta of ix.keys) {
+      if (meta.isSigner && !meta.pubkey.equals(wallet.publicKey)) {
+        unsupportedSignerKeys.add(meta.pubkey.toBase58());
+      }
+    }
+  }
+
+  if (unsupportedSignerKeys.size > 0) {
+    const list = [...unsupportedSignerKeys];
+    const msg = `[route] instruction requires unsupported signer(s): ${list.join(', ')}`;
+    if (CFG.debugSim) {
+      console.warn(msg);
+    }
+    const err = new Error(msg);
+    (err as Error & { signers?: string[] }).signers = list;
+    throw err;
+  }
+
   const built = await buildAndMaybeLut(
     connection,
     wallet.publicKey,
