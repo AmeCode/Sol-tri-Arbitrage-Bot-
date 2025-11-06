@@ -207,6 +207,19 @@ async buildSwapIx(
   }
 
   // Build swap ixs via Raydium v2 instrument
+  // One-time debug print
+  console.log('[RAY-DEBUG]', {
+    poolId: poolInfo.id?.toString?.(),
+    poolKeysId: poolKeys?.id ?? null,
+    inputMint: inputMint.toBase58(),
+    tokenAccountIn: tokenAccountIn?.toBase58(),
+    tokenAccountOut: tokenAccountOut?.toBase58(),
+    wallet: ownerInfo.wallet?.toBase58(),
+    obs: observationIdPk?.toBase58() ?? null,
+    amountIn: amountInBn.toString(),
+    minOut: minOutBn.toString(),
+  });
+
   const swapIxBundle = instrument.makeSwapBaseInInstructions({
     poolInfo,
     poolKeys,
