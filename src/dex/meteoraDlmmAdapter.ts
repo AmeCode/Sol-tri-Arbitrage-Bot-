@@ -6,7 +6,7 @@ import {
 } from '@solana/web3.js';
 import BN from 'bn.js';
 import { NATIVE_MINT } from '@solana/spl-token';
-import DLMMDefault from '@meteora-ag/dlmm'; // <- default export in current versions
+import { createRequire } from 'module';
 
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
@@ -41,14 +41,43 @@ function assert(condition: any, msg: string): asserts condition {
 // ───────────────────────────────────────────────────────────────────────────────
 
 type DLMMType = any; // (SDK types differ across versions; keep runtime-flexible)
+const require = createRequire(import.meta.url);
+
 const dlmmCache = new Map<string, DLMMType>();
+
+let cachedSdk: any | null = null;
+
+function loadSdk(): any {
+  if (cachedSdk) return cachedSdk;
+
+  const candidates = [
+    '@meteora-ag/dlmm/dist/cjs/index.js',
+    '@meteora-ag/dlmm/dist/cjs',
+    '@meteora-ag/dlmm',
+  ];
+
+  for (const id of candidates) {
+    try {
+      const mod = require(id);
+      cachedSdk = mod?.default ?? mod;
+      return cachedSdk;
+    } catch (err) {
+      if (DEBUG) log('failed to load DLMM SDK candidate', id, err);
+    }
+  }
+
+  throw new Error(
+    `Unable to load Meteora DLMM SDK. Tried candidates: ${candidates.join(', ')}`,
+  );
+}
 
 async function loadDlmm(connection: Connection, poolPk: PublicKey): Promise<DLMMType> {
   const k = poolPk.toBase58();
   const cached = dlmmCache.get(k);
   if (cached) return cached;
   // Most versions expose: `const pool = await DLMM.create(connection, poolPk)`
-  const pool = await (DLMMDefault as any).create(connection, poolPk);
+  const sdk = loadSdk();
+  const pool = await sdk.create(connection, poolPk);
   dlmmCache.set(k, pool);
   return pool;
 }
@@ -115,7 +144,7 @@ export function makeMeteoraEdge(
       }
 
       // Fallback: bin-array route + exact-in quote
-      const BinAPI = (DLMMDefault as any);
+      const BinAPI = loadSdk();
       if (typeof BinAPI.getBinArrayForSwap !== 'function') {
         if (DEBUG) log('quoteOut: no supported quote method on this SDK build');
         return 0n;
@@ -185,9 +214,10 @@ export function makeMeteoraEdge(
         };
 
         // Some older builds require bin arrays in swap call; supply if needed.
-        if (typeof (DLMMDefault as any).getBinArrayForSwap === 'function') {
+        const sdk = loadSdk();
+        if (typeof sdk.getBinArrayForSwap === 'function') {
           try {
-            const binArrays = await (DLMMDefault as any).getBinArrayForSwap(connection, poolPk, dir);
+            const binArrays = await sdk.getBinArrayForSwap(connection, poolPk, dir);
             args.binArrays = binArrays;
           } catch {
             // ignore; not all versions need this
@@ -212,7 +242,7 @@ export function makeMeteoraEdge(
       }
 
       // Fallback path: legacy quote + swap
-      const BinAPI = (DLMMDefault as any);
+      const BinAPI = loadSdk();
       assert(typeof BinAPI.getBinArrayForSwap === 'function', 'DLMM SDK missing getBinArrayForSwap');
 
       const binArrays = await BinAPI.getBinArrayForSwap(connection, poolPk, dir);
