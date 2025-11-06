@@ -6,7 +6,7 @@ import { makeConnections } from '../rpc.js';
 import { WsAccountCache } from '../util/wsCache.js';
 import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
 import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
-import { makeMeteoraEdge, MeteoraSwapDirection } from '../dex/meteoraDlmmAdapter.js';
+import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
 import { canonicalMint, WSOL_MINT } from '../util/mints.js';
 import { loadRayIndexOnce, rayIndex } from '../initRay.js';
 import { isTradable } from '../ray/clmmIndex.js';
@@ -38,14 +38,14 @@ function mintForSymbol(symbol: string, envKey: string): string {
 }
 
 export async function buildEdges(): Promise<PoolEdge[]> {
-  const { read } = makeConnections();
-  const cache = new WsAccountCache(read);
+  const { read: readConn } = makeConnections();
+  const cache = new WsAccountCache(readConn);
 
   await loadRayIndexOnce();
 
   // Wallet pubkey is only needed by Orca SDK context (dummy signer ok)
   const dummyWallet = new PublicKey(WSOL_MINT); // any 32B pk works; real payer signs in index.ts
-  const orcaCtx = initOrcaCtx(read, dummyWallet);
+  const orcaCtx = initOrcaCtx(readConn, dummyWallet);
 
   const edges: PoolEdge[] = [];
 
@@ -102,16 +102,8 @@ export async function buildEdges(): Promise<PoolEdge[]> {
     const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
     const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
-      {
-        ...makeMeteoraEdge(p.id, fromMint, toMint, MeteoraSwapDirection.AtoB),
-        from: fromMint,
-        to: toMint,
-      },
-      {
-        ...makeMeteoraEdge(p.id, toMint, fromMint, MeteoraSwapDirection.BtoA),
-        from: toMint,
-        to: fromMint,
-      }
+      makeMeteoraEdge(readConn, p.id, fromMint, toMint),
+      makeMeteoraEdge(readConn, p.id, toMint, fromMint),
     );
   }
 
