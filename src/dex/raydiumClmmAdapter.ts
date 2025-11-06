@@ -1,10 +1,47 @@
-import { PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
+import BN from 'bn.js';
+import { NATIVE_MINT } from '@solana/spl-token';
+
 import { rayIndex } from '../initRay.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { isTradable, normMintA, normMintB } from '../ray/clmmIndex.js';
+import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
 
-export function makeRayClmmEdge(poolId: string, mintA: string, mintB: string): PoolEdge {
+type ClmmTools = {
+  clmm: any;
+  instrument: any;
+};
+
+const sdkModulePromise = import('@raydium-io/raydium-sdk-v2');
+const clmmClientCache = new WeakMap<Connection, Promise<ClmmTools>>();
+
+async function loadClmmTools(connection: Connection): Promise<ClmmTools> {
+  let cached = clmmClientCache.get(connection);
+  if (!cached) {
+    cached = (async () => {
+      const { Raydium, Clmm, Api, ClmmInstrument } = await sdkModulePromise;
+      const api = new Api({ cluster: 'mainnet' });
+      const raydium = new Raydium({ connection, api });
+      const clmm = new Clmm({ scope: raydium, moduleName: 'Clmm' });
+      return { clmm, instrument: ClmmInstrument };
+    })();
+    clmmClientCache.set(connection, cached);
+  }
+  return cached;
+}
+
+export function makeRayClmmEdge(
+  connection: Connection,
+  poolId: string,
+  mintA: string,
+  mintB: string,
+): PoolEdge {
   const configuredId = new PublicKey(poolId).toBase58();
+  const mintAPk = new PublicKey(mintA);
+  const mintBPk = new PublicKey(mintB);
+
+  let cachedPoolInfo: any | null = null;
+  let cachedPoolKeys: any | null = null;
 
   async function resolvePoolId(): Promise<string> {
     // direct hit?
@@ -58,6 +95,28 @@ export function makeRayClmmEdge(poolId: string, mintA: string, mintB: string): P
     return (p.id || p.pool_id)!;
   }
 
+  async function loadPoolInfo(resolvedId: string): Promise<any> {
+    if (cachedPoolInfo) return cachedPoolInfo;
+    const { clmm } = await loadClmmTools(connection);
+    const info = await clmm.getRpcClmmPoolInfo({ poolId: resolvedId });
+    if (!info) {
+      throw new Error(`raydium: failed to load pool info for ${resolvedId}`);
+    }
+    cachedPoolInfo = { ...info, id: resolvedId };
+    return cachedPoolInfo;
+  }
+
+  async function loadPoolKeys(resolvedId: string): Promise<any> {
+    if (cachedPoolKeys) return cachedPoolKeys;
+    const { clmm } = await loadClmmTools(connection);
+    const keys = await clmm.getClmmPoolKeys(resolvedId);
+    if (!keys) {
+      throw new Error(`raydium: failed to load pool keys for ${resolvedId}`);
+    }
+    cachedPoolKeys = keys;
+    return cachedPoolKeys;
+  }
+
   return {
     id: `ray:${configuredId}`,
     from: mintA,
@@ -78,8 +137,74 @@ export function makeRayClmmEdge(poolId: string, mintA: string, mintB: string): P
       _minOut: bigint,
       _user: PublicKey,
     ): Promise<SwapInstructionBundle> {
+      if (_amountIn <= 0n) throw new Error('raydium: amountIn must be > 0');
+      if (_minOut < 0n) throw new Error('raydium: minOut must be >= 0');
+
       const id = await resolvePoolId();
-      throw new Error(`raydium: buildSwapIx not implemented for ${id}`);
+      const poolInfo = await loadPoolInfo(id);
+      const poolKeys = await loadPoolKeys(id);
+      const { instrument } = await loadClmmTools(connection);
+
+      const fromMintPk = new PublicKey(this.from);
+      const toMintPk = new PublicKey(this.to);
+
+      const directionAToB = fromMintPk.equals(mintAPk) && toMintPk.equals(mintBPk);
+      const directionBToA = fromMintPk.equals(mintBPk) && toMintPk.equals(mintAPk);
+      if (!directionAToB && !directionBToA) {
+        throw new Error(`raydium: direction mismatch for pool ${id}`);
+      }
+
+      const setupIxs: TransactionInstruction[] = [];
+
+      let tokenAccountA: PublicKey;
+      if (mintAPk.equals(NATIVE_MINT) && directionAToB) {
+        const wrapped = wrapSolIntoAta(_user, _user, _amountIn);
+        setupIxs.push(...wrapped.ixs);
+        tokenAccountA = wrapped.ata;
+      } else {
+        const ensured = ensureAtaIx(_user, _user, mintAPk);
+        setupIxs.push(...ensured.ixs);
+        tokenAccountA = ensured.ata;
+      }
+
+      let tokenAccountB: PublicKey;
+      if (mintBPk.equals(NATIVE_MINT) && directionBToA) {
+        const wrapped = wrapSolIntoAta(_user, _user, _amountIn);
+        setupIxs.push(...wrapped.ixs);
+        tokenAccountB = wrapped.ata;
+      } else {
+        const ensured = ensureAtaIx(_user, _user, mintBPk);
+        setupIxs.push(...ensured.ixs);
+        tokenAccountB = ensured.ata;
+      }
+
+      const inputMintPk = directionAToB ? mintAPk : mintBPk;
+
+      const ownerInfo = {
+        wallet: _user,
+        tokenAccountA,
+        tokenAccountB,
+      };
+
+      const amountInBn = new BN(_amountIn.toString());
+      const minOutBn = new BN(_minOut.toString());
+
+      const observationId = poolKeys?.observationId ?? poolInfo?.observationId ?? poolInfo?.observationIdKey;
+
+      const swap = instrument.makeSwapBaseInInstructions({
+        poolInfo,
+        poolKeys,
+        observationId,
+        ownerInfo,
+        inputMint: inputMintPk,
+        amountIn: amountInBn,
+        amountOutMin: minOutBn,
+        sqrtPriceLimitX64: undefined,
+        remainingAccounts: [],
+      });
+
+      const swapIxs: TransactionInstruction[] = swap?.instructions ?? [];
+      return { ixs: [...setupIxs, ...swapIxs] };
     }
   };
 }
