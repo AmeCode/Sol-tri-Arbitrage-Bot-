@@ -6,7 +6,7 @@ import { makeConnections } from '../rpc.js';
 import { WsAccountCache } from '../util/wsCache.js';
 import { initOrcaCtx, makeOrcaEdge } from '../dex/orcaWhirlpoolAdapter.js';
 import { makeRayClmmEdge } from '../dex/raydiumClmmAdapter.js';
-import { makeMeteoraEdge } from '../dex/meteoraDlmmAdapter.js';
+import { makeMeteoraEdge, MeteoraSwapDirection } from '../dex/meteoraDlmmAdapter.js';
 import { canonicalMint, WSOL_MINT } from '../util/mints.js';
 import { loadRayIndexOnce, rayIndex } from '../initRay.js';
 import { isTradable } from '../ray/clmmIndex.js';
@@ -102,8 +102,16 @@ export async function buildEdges(): Promise<PoolEdge[]> {
     const fromMint = canonicalMint(mintForSymbol(p.a, p.key));
     const toMint = canonicalMint(mintForSymbol(p.b, p.key));
     edges.push(
-      { ...makeMeteoraEdge(p.id, fromMint, toMint), from: fromMint, to: toMint },
-      { ...makeMeteoraEdge(p.id, toMint, fromMint), from: toMint, to: fromMint }
+      {
+        ...makeMeteoraEdge(p.id, fromMint, toMint, MeteoraSwapDirection.AtoB),
+        from: fromMint,
+        to: toMint,
+      },
+      {
+        ...makeMeteoraEdge(p.id, toMint, fromMint, MeteoraSwapDirection.BtoA),
+        from: toMint,
+        to: fromMint,
+      }
     );
   }
 

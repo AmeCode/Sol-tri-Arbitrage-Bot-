@@ -9,11 +9,13 @@
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.14.0",
+    "@meteora-ag/dlmm": "^1.8.0",
     "@orca-so/common-sdk": "^0.6.11",
     "@orca-so/whirlpools-sdk": "^0.13.4",
     "@raydium-io/raydium-sdk-v2": "^0.2.30-alpha",
     "@solana/spl-token": "^0.4.7",
     "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.2",
     "bs58": "^5.0.0",
     "decimal.js": "^10.6.0",
     "dotenv": "^16.4.5",
