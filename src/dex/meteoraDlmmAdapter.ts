@@ -1,5 +1,7 @@
 import { PublicKey, TransactionInstruction, SystemProgram } from '@solana/web3.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
+import { NATIVE_MINT } from '@solana/spl-token';
+import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
 
 /**
  * METEORA DLMM (lightweight) adapter with:
@@ -80,6 +82,8 @@ function encodeDlmmSwap(params: {
   outputMint: PublicKey;
   amountIn: bigint;
   minOut: bigint;
+  sourceTokenAccount: PublicKey;
+  destinationTokenAccount: PublicKey;
 }): TransactionInstruction {
   // Sanity checks
   assert(!params.inputMint.equals(params.outputMint), 'inputMint and outputMint must differ');
@@ -98,6 +102,8 @@ function encodeDlmmSwap(params: {
   const keys = [
     { pubkey: params.user,   isSigner: true,  isWritable: true  }, // payer
     { pubkey: params.poolId, isSigner: false, isWritable: true  }, // pool state
+    { pubkey: params.sourceTokenAccount, isSigner: false, isWritable: true },
+    { pubkey: params.destinationTokenAccount, isSigner: false, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
   ];
 
@@ -169,6 +175,23 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
         programId: DLMM_PROGRAM_ID.toBase58(),
       });
 
+      const setupIxs: TransactionInstruction[] = [];
+
+      let sourceAta: PublicKey;
+      if (inMintPk.equals(NATIVE_MINT)) {
+        const wrapped = wrapSolIntoAta(user, user, amountIn);
+        setupIxs.push(...wrapped.ixs);
+        sourceAta = wrapped.ata;
+      } else {
+        const ensured = ensureAtaIx(user, user, inMintPk);
+        setupIxs.push(...ensured.ixs);
+        sourceAta = ensured.ata;
+      }
+
+      const ensuredDst = ensureAtaIx(user, user, outMintPk);
+      setupIxs.push(...ensuredDst.ixs);
+      const destinationAta = ensuredDst.ata;
+
       const ix = encodeDlmmSwap({
         programId: DLMM_PROGRAM_ID,
         poolId: poolPk,
@@ -177,9 +200,11 @@ export function makeMeteoraEdge(poolId: string, inputMint: string, outputMint: s
         outputMint: outMintPk,
         amountIn,
         minOut,
+        sourceTokenAccount: sourceAta,
+        destinationTokenAccount: destinationAta,
       });
 
-      return { ixs: [ix] };
+      return { ixs: [...setupIxs, ix] };
     },
   };
 }

@@ -1,15 +1,19 @@
-import { PublicKey, TransactionInstruction } from '@solana/web3.js';
+import { Keypair, PublicKey, Signer, TransactionInstruction } from '@solana/web3.js';
 import {
   WhirlpoolContext,
   ORCA_WHIRLPOOL_PROGRAM_ID,
   buildWhirlpoolClient,
   swapQuoteByInputToken,
   UseFallbackTickArray,
+  SwapUtils,
 } from '@orca-so/whirlpools-sdk';
+import { swapIx } from '@orca-so/whirlpools-sdk/dist/instructions/swap-ix.js';
 import { Percentage } from '@orca-so/common-sdk';
 import BN from 'bn.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { CFG } from '../config.js';
+import { NATIVE_MINT } from '@solana/spl-token';
+import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
 
 export function makeOrcaEdge(
   whirlpool: string,
@@ -53,10 +57,11 @@ export function makeOrcaEdge(
     async buildSwapIx(
       amountIn: bigint,
       _minOut: bigint,
-      _user: PublicKey,
+      user: PublicKey,
     ): Promise<SwapInstructionBundle> {
       const pool = await client.getPool(poolPk);
       const inputMint = getInputMint(this.from);
+      const outputMint = this.from === mintA ? new PublicKey(mintB) : new PublicKey(mintA);
       const slippage = Percentage.fromFraction(CFG.maxSlippageBps, 10_000);
 
       const quote = await swapQuoteByInputToken(
@@ -70,8 +75,45 @@ export function makeOrcaEdge(
         UseFallbackTickArray.Never
       );
 
-      const tb = await pool.swap(quote);
-      return { ixs: tb.compressIx(false).instructions };
+      const instructions: TransactionInstruction[] = [];
+
+      let sourceAta: PublicKey;
+      if (inputMint.equals(NATIVE_MINT)) {
+        const wrapped = wrapSolIntoAta(user, user, amountIn);
+        instructions.push(...wrapped.ixs);
+        sourceAta = wrapped.ata;
+      } else {
+        const ensured = ensureAtaIx(user, user, inputMint);
+        instructions.push(...ensured.ixs);
+        sourceAta = ensured.ata;
+      }
+
+      const ensuredDst = ensureAtaIx(user, user, outputMint);
+      instructions.push(...ensuredDst.ixs);
+      const destinationAta = ensuredDst.ata;
+
+      const params = SwapUtils.getSwapParamsFromQuote(
+        quote,
+        ctx,
+        pool,
+        sourceAta,
+        destinationAta,
+        user,
+      );
+
+      const swapInstruction = swapIx(ctx.program, params);
+      instructions.push(...swapInstruction.instructions);
+      instructions.push(...swapInstruction.cleanupInstructions);
+
+      const extraSigners = swapInstruction.signers.filter((signer: Signer): signer is Keypair =>
+        Object.prototype.hasOwnProperty.call(signer, 'secretKey'),
+      );
+
+      if (extraSigners.length > 0) {
+        return { ixs: instructions, extraSigners };
+      }
+
+      return { ixs: instructions };
     }
   };
 }
