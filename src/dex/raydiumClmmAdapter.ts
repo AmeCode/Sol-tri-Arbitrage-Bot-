@@ -236,26 +236,35 @@ export function makeRayClmmEdge(
 
       const id = await resolvePoolId();
 
-      // 1) API JSON (to build the minimal poolInfo the instrument requires)
       const apiItem = await ensureApiPoolInfoForClmm(id);
 
-      // 2) On-chain CLMM keys so vault.{A,B} exist
       const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection);
-      const poolKeys = await clmm.getClmmPoolKeys(id);
+      const { PoolUtils } = await sdkModulePromise;
+
+      const {
+        poolInfo: rpcPoolInfo,
+        poolKeys: initialPoolKeys,
+        computePoolInfo,
+        tickData,
+      } = await clmm.getPoolInfoFromRpc(id);
+
+      let poolKeys = initialPoolKeys;
+      if (!poolKeys?.lookupTableAccount) {
+        const fetched = await clmm.getClmmPoolKeys(id);
+        poolKeys = { ...poolKeys, lookupTableAccount: fetched.lookupTableAccount };
+      }
       if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
         throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`);
       }
 
-      // 3) Build exact poolInfo shape required by instrument
       const poolInfo = {
-        id: apiItem.id,
-        programId: apiItem.programId,
-        mintA: { address: apiItem.mintA.address },
-        mintB: { address: apiItem.mintB.address },
-        config: { id: apiItem.config.id },
+        id: rpcPoolInfo.id,
+        programId: rpcPoolInfo.programId,
+        mintA: { address: rpcPoolInfo.mintA.address },
+        mintB: { address: rpcPoolInfo.mintB.address },
+        config: { id: rpcPoolInfo.config.id },
       };
 
-      // 4) Direction using edge.from / edge.to
       const mintAPk = new PublicKey(apiItem.mintA.address);
       const mintBPk = new PublicKey(apiItem.mintB.address);
       const inputMintPk = new PublicKey(this.from);
@@ -301,6 +310,19 @@ export function makeRayClmmEdge(
       // inputMint param must be the actual input side
       const instrumentInputMint = inputMintPk;
 
+      const poolTickCache = tickData[id] ?? tickData[computePoolInfo.id.toBase58()];
+      if (!poolTickCache) {
+        throw new Error(`raydium: missing tick array cache for ${id}`);
+      }
+
+      const { remainingAccounts } = PoolUtils.getOutputAmountAndRemainAccounts(
+        computePoolInfo,
+        poolTickCache,
+        instrumentInputMint,
+        amountInBn,
+        sqrtPriceLimitX64,
+      );
+
       if (DEBUG) {
         console.debug('[RAY-CLMM buildSwapIx]', {
           poolId: id,
@@ -330,7 +352,7 @@ export function makeRayClmmEdge(
         amountIn: amountInBn,
         amountOutMin: minOutBn,
         sqrtPriceLimitX64,
-        remainingAccounts: [],
+        remainingAccounts,
       });
 
       const rayIxs: TransactionInstruction[] = (bundle?.instructions ?? []) as TransactionInstruction[];
@@ -338,7 +360,10 @@ export function makeRayClmmEdge(
         throw new Error('raydium: ClmmInstrument returned no instructions');
       }
 
-      return { ixs: [...setupIxs, ...rayIxs] };
+      return {
+        ixs: [...setupIxs, ...rayIxs],
+        lookupTableAddresses: (bundle?.lookupTableAddress ?? []) as PublicKey[],
+      };
     },
   };
 }
