@@ -110,10 +110,10 @@ export function makeOrcaEdge(
       );
 
       if (extraSigners.length > 0) {
-        return { ixs: instructions, extraSigners };
+        return { ixs: instructions, extraSigners, lookupTables: [] };
       }
 
-      return { ixs: instructions };
+      return { ixs: instructions, lookupTables: [] };
     }
   };
 }
