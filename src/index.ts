@@ -16,6 +16,23 @@ function allowedByHopCount(pathLen: number, lutExists: boolean) {
   return false;
 }
 
+function isInvalidLookupTableError(err: unknown, logs?: string[] | null): boolean {
+  try {
+    const errString = typeof err === 'string' ? err : JSON.stringify(err);
+    if (errString && errString.toLowerCase().includes('invalid index')) return true;
+  } catch {
+    /* ignore */
+  }
+  if (Array.isArray(logs)) {
+    for (const line of logs) {
+      if (typeof line === 'string' && line.toLowerCase().includes('invalid index')) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 async function primeLutFromRegistry(connection: Connection, wallet: Keypair) {
   const pools = [...CFG.pools.orca, ...CFG.pools.ray, ...CFG.pools.meteora];
   const seen = new Set<string>();
@@ -127,6 +144,8 @@ async function main() {
         console.log('[send] building tx...');
         const swapIxs: TransactionInstruction[] = [];
         const extraSigners: Keypair[] = [];
+        const dexLookupTables: PublicKey[] = [];
+        const dexLookupSet = new Set<string>();
         let amountIn = sized.inAmount;
         for (let i = 0; i < path.length; i++) {
           const edge = path[i];
@@ -135,6 +154,15 @@ async function main() {
           swapIxs.push(...result.ixs);
           if (result.extraSigners?.length) {
             extraSigners.push(...result.extraSigners);
+          }
+          if (result.lookupTableAddresses?.length) {
+            for (const lut of result.lookupTableAddresses) {
+              const key = lut.toBase58();
+              if (!dexLookupSet.has(key)) {
+                dexLookupSet.add(key);
+                dexLookupTables.push(lut);
+              }
+            }
           }
           amountIn = minOut;
         }
@@ -148,7 +176,7 @@ async function main() {
         let skipTune = false;
         try {
           // 👉 Build (legacy first, then v0/LUT if needed)
-          const built = await buildAndMaybeLut(
+          let built = await buildAndMaybeLut(
             sendConn,
             wallet.publicKey,
             wallet,
@@ -156,15 +184,41 @@ async function main() {
             /* cuPrice */ priorityFee,      // micro-lamports per CU
             /* cuLimit  */ CFG.cuLimit ?? 1_400_000,
             /* extraSignerPubkeys */ extraSigners.map(k => k.publicKey),
+            /* dexLookupTables */ dexLookupTables,
+            /* includeRuntimeLut */ true,
           );
 
           console.log('[route] instructions count =', swapIxs.length);
           if ('lutAddressUsed' in built && built.lutAddressUsed) {
             console.log('[lut] used', built.lutAddressUsed.toBase58());
           }
+          if (dexLookupTables.length) {
+            console.log('[lut] dex tables', dexLookupTables.map(l => l.toBase58()));
+          }
 
           // 👉 Simulate (always signed; gets logs)
-          const sim = await simulateWithLogs(sendConn, built, [wallet, ...extraSigners]);
+          let sim = await simulateWithLogs(sendConn, built, [wallet, ...extraSigners]);
+          if (
+            sim.value.err &&
+            built.kind === 'v0' &&
+            dexLookupTables.length > 0 &&
+            isInvalidLookupTableError(sim.value.err, sim.value.logs)
+          ) {
+            console.warn('[sim] invalid LUT index detected → rebuilding without runtime LUT');
+            built = await buildAndMaybeLut(
+              sendConn,
+              wallet.publicKey,
+              wallet,
+              swapIxs,
+              /* cuPrice */ priorityFee,
+              /* cuLimit  */ CFG.cuLimit ?? 1_400_000,
+              /* extraSignerPubkeys */ extraSigners.map(k => k.publicKey),
+              /* dexLookupTables */ dexLookupTables,
+              /* includeRuntimeLut */ false,
+            );
+            sim = await simulateWithLogs(sendConn, built, [wallet, ...extraSigners]);
+          }
+
           if (sim.value.err) {
             console.warn('[sim] failed:', sim.value.err);
             sim.value.logs?.forEach((l, i) => console.warn(String(i).padStart(2, '0'), l));

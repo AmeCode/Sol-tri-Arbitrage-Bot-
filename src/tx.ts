@@ -1,4 +1,5 @@
 import {
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   PublicKey,
@@ -47,6 +48,8 @@ export async function buildAndMaybeLut(
   cuPriceMicroLamports?: number,
   cuLimit?: number,
   extraSignerPubkeys: PublicKey[] = [],
+  dexLookupTableAddresses: PublicKey[] = [],
+  includeRuntimeLut = true,
 ): Promise<
   | { kind: 'legacy'; tx: Transaction; lutAddressUsed?: PublicKey }
   | { kind: 'v0'; tx: VersionedTransaction; lutAddressUsed?: PublicKey }
@@ -74,38 +77,67 @@ export async function buildAndMaybeLut(
   }
 
   // 2) v0 with LUT (collect all accounts)
-  const keySet = new Set<string>();
-  const requiredKeys: PublicKey[] = [];
-  function add(k: PublicKey) {
-    const s = k.toBase58();
-    if (!keySet.has(s)) {
-      keySet.add(s);
-      requiredKeys.push(k);
+  const uniqueDexLuts: PublicKey[] = [];
+  const seenDex = new Set<string>();
+  for (const addr of dexLookupTableAddresses) {
+    const key = addr.toBase58();
+    if (!seenDex.has(key)) {
+      seenDex.add(key);
+      uniqueDexLuts.push(addr);
     }
   }
-  for (const ix of withCb) {
-    add(ix.programId);
-    for (const k of ix.keys) add(k.pubkey);
+
+  const dexLookupAccounts: AddressLookupTableAccount[] = [];
+  for (const addr of uniqueDexLuts) {
+    const lut = (await connection.getAddressLookupTable(addr)).value;
+    if (!lut) throw new Error(`LUT not found on chain: ${addr.toBase58()}`);
+    dexLookupAccounts.push(lut);
   }
 
-  const ensured = await ensureLutHas(
-    connection,
-    payer,
-    payerSigner as any,
-    runtimeLutAddress,
-    requiredKeys,
-  );
-  runtimeLutAddress = ensured;
+  let ensured: PublicKey | null = null;
+  let runtimeLutAcc: AddressLookupTableAccount | null = null;
+  if (includeRuntimeLut) {
+    const keySet = new Set<string>();
+    const requiredKeys: PublicKey[] = [];
+    const add = (k: PublicKey) => {
+      const s = k.toBase58();
+      if (!keySet.has(s)) {
+        keySet.add(s);
+        requiredKeys.push(k);
+      }
+    };
+    for (const ix of withCb) {
+      add(ix.programId);
+      for (const k of ix.keys) add(k.pubkey);
+    }
 
-  // Compile v0
-  const lutAcc = (await connection.getAddressLookupTable(ensured)).value;
-  if (!lutAcc) throw new Error('LUT not found on chain');
+    ensured = await ensureLutHas(
+      connection,
+      payer,
+      payerSigner as any,
+      runtimeLutAddress,
+      requiredKeys,
+    );
+    runtimeLutAddress = ensured;
+
+    const lutAcc = (await connection.getAddressLookupTable(ensured)).value;
+    if (!lutAcc) throw new Error('LUT not found on chain');
+    runtimeLutAcc = lutAcc;
+  }
+
   const { blockhash } = await connection.getLatestBlockhash();
   const msg = new TransactionMessage({
     payerKey: payer,
     recentBlockhash: blockhash,
     instructions: withCb,
-  }).compileToV0Message([lutAcc]);
+  }).compileToV0Message([
+    ...dexLookupAccounts,
+    ...(runtimeLutAcc ? [runtimeLutAcc] : []),
+  ]);
 
-  return { kind: 'v0', tx: new VersionedTransaction(msg), lutAddressUsed: ensured };
+  return {
+    kind: 'v0',
+    tx: new VersionedTransaction(msg),
+    lutAddressUsed: includeRuntimeLut && ensured ? ensured : undefined,
+  };
 }

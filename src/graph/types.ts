@@ -8,6 +8,7 @@ export type Mint = string;
 export interface SwapInstructionBundle {
   ixs: TransactionInstruction[];
   extraSigners?: Keypair[];
+  lookupTableAddresses?: PublicKey[];
 }
 
 export interface PoolEdge {
