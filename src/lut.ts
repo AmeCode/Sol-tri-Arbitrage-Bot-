@@ -2,6 +2,7 @@ import {
   AddressLookupTableAccount,
   AddressLookupTableProgram,
   Commitment,
+  ComputeBudgetProgram,
   Connection,
   Keypair,
   PublicKey,
@@ -159,21 +160,64 @@ export async function ensureLutHas(
 export async function buildV0WithLut(params: {
   connection: Connection;
   payer: PublicKey;
-  lutAddress: PublicKey;
+  /** optional app/user LUT */
+  lutAddress?: PublicKey;
+  /** dex LUTs that must come first, in order */
+  dexLookupTables?: PublicKey[];
   cuLimit?: number;
   cuPriceMicroLamports?: number;
   instructions: TransactionInstruction[];
 }) {
-  const { connection, payer, lutAddress, instructions } = params;
-  const lutAcc = (await connection.getAddressLookupTable(lutAddress)).value;
-  if (!lutAcc) throw new Error('LUT not found on chain');
+  const {
+    connection,
+    payer,
+    lutAddress,
+    dexLookupTables = [],
+    cuLimit,
+    cuPriceMicroLamports,
+    instructions,
+  } = params;
 
-  const { blockhash } = await connection.getLatestBlockhash('finalized');
+  const pre: TransactionInstruction[] = [];
+  if (cuLimit && cuLimit > 0) {
+    pre.push(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+  }
+  if (cuPriceMicroLamports && cuPriceMicroLamports > 0) {
+    pre.push(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: cuPriceMicroLamports })
+    );
+  }
+  const finalInstructions = [...pre, ...instructions];
+
+  const dexLutAccounts: AddressLookupTableAccount[] = [];
+  const fetchedDex = new Map<string, AddressLookupTableAccount>();
+  for (const pk of dexLookupTables) {
+    const key = pk.toBase58();
+    let acc = fetchedDex.get(key) ?? null;
+    if (!acc) {
+      acc = (await connection.getAddressLookupTable(pk)).value;
+      if (!acc) {
+        throw new Error(`LUT not found on chain: ${key}`);
+      }
+      fetchedDex.set(key, acc);
+    }
+    dexLutAccounts.push(acc);
+  }
+
+  let appLutAcc: AddressLookupTableAccount | null = null;
+  if (lutAddress) {
+    appLutAcc = (await connection.getAddressLookupTable(lutAddress)).value;
+    if (!appLutAcc) {
+      throw new Error(`LUT not found on chain: ${lutAddress.toBase58()}`);
+    }
+  }
+
+  const { blockhash } = await connection.getLatestBlockhash();
   const msg = new TransactionMessage({
     payerKey: payer,
     recentBlockhash: blockhash,
-    instructions,
-  }).compileToV0Message([lutAcc]);
+    instructions: finalInstructions,
+  }).compileToV0Message(appLutAcc ? [...dexLutAccounts, appLutAcc] : dexLutAccounts);
 
   return new VersionedTransaction(msg);
 }

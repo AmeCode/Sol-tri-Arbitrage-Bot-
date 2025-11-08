@@ -1,16 +1,14 @@
 import {
-  AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   PublicKey,
   Signer,
   Transaction,
   TransactionInstruction,
-  TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
 import { CFG } from './config.js';
-import { ensureLutHas } from './lut.js';
+import { buildV0WithLut, ensureLutHas } from './lut.js';
 import { assertNoUnwhitelistedAllocations } from './txGuards.js';
 import { sanitizeWithSignerWhitelist } from './txSanitize.js';
 
@@ -48,7 +46,7 @@ export async function buildAndMaybeLut(
   cuPriceMicroLamports?: number,
   cuLimit?: number,
   extraSignerPubkeys: PublicKey[] = [],
-  dexLookupTableAddresses: PublicKey[] = [],
+  dexLookupTables: PublicKey[] = [],
   includeRuntimeLut = true,
 ): Promise<
   | { kind: 'legacy'; tx: Transaction; lutAddressUsed?: PublicKey }
@@ -59,7 +57,8 @@ export async function buildAndMaybeLut(
   assertNoUnwhitelistedAllocations(rawInstructions, payer, allowed);
 
   const sanitized = sanitizeWithSignerWhitelist(rawInstructions, payer, allowed);
-  const withCb = withComputeBudget(sanitized, cuLimit ?? CFG.cuLimit, cuPriceMicroLamports);
+  const targetCuLimit = cuLimit ?? CFG.cuLimit;
+  const withCb = withComputeBudget(sanitized, targetCuLimit, cuPriceMicroLamports);
 
   // 1) Try legacy first (fast path)
   try {
@@ -76,26 +75,7 @@ export async function buildAndMaybeLut(
     // too big → build v0 with LUT
   }
 
-  // 2) v0 with LUT (collect all accounts)
-  const uniqueDexLuts: PublicKey[] = [];
-  const seenDex = new Set<string>();
-  for (const addr of dexLookupTableAddresses) {
-    const key = addr.toBase58();
-    if (!seenDex.has(key)) {
-      seenDex.add(key);
-      uniqueDexLuts.push(addr);
-    }
-  }
-
-  const dexLookupAccounts: AddressLookupTableAccount[] = [];
-  for (const addr of uniqueDexLuts) {
-    const lut = (await connection.getAddressLookupTable(addr)).value;
-    if (!lut) throw new Error(`LUT not found on chain: ${addr.toBase58()}`);
-    dexLookupAccounts.push(lut);
-  }
-
   let ensured: PublicKey | null = null;
-  let runtimeLutAcc: AddressLookupTableAccount | null = null;
   if (includeRuntimeLut) {
     const keySet = new Set<string>();
     const requiredKeys: PublicKey[] = [];
@@ -119,25 +99,20 @@ export async function buildAndMaybeLut(
       requiredKeys,
     );
     runtimeLutAddress = ensured;
-
-    const lutAcc = (await connection.getAddressLookupTable(ensured)).value;
-    if (!lutAcc) throw new Error('LUT not found on chain');
-    runtimeLutAcc = lutAcc;
   }
-
-  const { blockhash } = await connection.getLatestBlockhash();
-  const msg = new TransactionMessage({
-    payerKey: payer,
-    recentBlockhash: blockhash,
-    instructions: withCb,
-  }).compileToV0Message([
-    ...dexLookupAccounts,
-    ...(runtimeLutAcc ? [runtimeLutAcc] : []),
-  ]);
+  const tx = await buildV0WithLut({
+    connection,
+    payer,
+    lutAddress: includeRuntimeLut && ensured ? ensured : undefined,
+    dexLookupTables,
+    cuLimit: targetCuLimit,
+    cuPriceMicroLamports,
+    instructions: sanitized,
+  });
 
   return {
     kind: 'v0',
-    tx: new VersionedTransaction(msg),
+    tx,
     lutAddressUsed: includeRuntimeLut && ensured ? ensured : undefined,
   };
 }
