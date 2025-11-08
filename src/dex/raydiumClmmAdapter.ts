@@ -53,6 +53,21 @@ function mustPk(v: string | PublicKey | undefined, label: string): PublicKey {
   }
 }
 
+function normalizeLookupTables(input: unknown): PublicKey[] {
+  if (!input) return [];
+  const arr = Array.isArray(input) ? input : [input];
+  const out: PublicKey[] = [];
+  for (const value of arr) {
+    if (!value) continue;
+    try {
+      out.push(value instanceof PublicKey ? value : new PublicKey(value));
+    } catch {
+      /* ignore invalid entries */
+    }
+  }
+  return out;
+}
+
 async function fetchApiPoolById(id: string): Promise<any | null> {
   const url = `https://api-v3.raydium.io/pools/info/ids?ids=${encodeURIComponent(id)}`;
   let res: Response | null = null;
@@ -333,7 +348,9 @@ export function makeRayClmmEdge(
       // If not, you will see "address table lookup uses an invalid index".
       // (Your framework already logs and includes dex tables; keep doing that.)
 
-      return { ixs: [...setupIxs, ...rayIxs] };
+      const lookupTables = normalizeLookupTables((bundle as any)?.lookupTableAddress);
+
+      return { ixs: [...setupIxs, ...rayIxs], lookupTables };
     },
   };
 }

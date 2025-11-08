@@ -32,6 +32,21 @@ function toPk(value: string, label: string): PublicKey {
   }
 }
 
+function normalizeLookupTables(input: unknown): PublicKey[] {
+  if (!input) return [];
+  const arr = Array.isArray(input) ? input : [input];
+  const out: PublicKey[] = [];
+  for (const value of arr) {
+    if (!value) continue;
+    try {
+      out.push(value instanceof PublicKey ? value : new PublicKey(value));
+    } catch {
+      /* ignore invalid entries */
+    }
+  }
+  return out;
+}
+
 function assert(condition: any, msg: string): asserts condition {
   if (!condition) throw new Error(msg);
 }
@@ -226,6 +241,10 @@ export function makeMeteoraEdge(
 
         const { innerTransaction } = await dlmm.swap(args);
         const ixs = (innerTransaction?.instructions ?? []) as TransactionInstruction[];
+        const lookupTables = normalizeLookupTables(
+          (innerTransaction as any)?.lookupTableAddress ??
+            (innerTransaction as any)?.lookupTableAddresses,
+        );
 
         if (DEBUG) {
           log('buildSwapIx:newAPI', {
@@ -238,7 +257,7 @@ export function makeMeteoraEdge(
           });
         }
 
-        return { ixs: [...setupIxs, ...ixs] };
+        return { ixs: [...setupIxs, ...ixs], lookupTables };
       }
 
       // Fallback path: legacy quote + swap
@@ -270,6 +289,10 @@ export function makeMeteoraEdge(
       });
 
       const ixs = (innerTransaction?.instructions ?? []) as TransactionInstruction[];
+      const lookupTables = normalizeLookupTables(
+        (innerTransaction as any)?.lookupTableAddress ??
+          (innerTransaction as any)?.lookupTableAddresses,
+      );
 
       if (DEBUG) {
         log('buildSwapIx:legacyAPI', {
@@ -282,7 +305,7 @@ export function makeMeteoraEdge(
         });
       }
 
-      return { ixs: [...setupIxs, ...ixs] };
+      return { ixs: [...setupIxs, ...ixs], lookupTables };
     },
   };
 }
