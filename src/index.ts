@@ -145,7 +145,6 @@ async function main() {
         const swapIxs: TransactionInstruction[] = [];
         const extraSigners: Keypair[] = [];
         const dexLookupTables: PublicKey[] = [];
-        const dexLookupSet = new Set<string>();
         let amountIn = sized.inAmount;
         for (let i = 0; i < path.length; i++) {
           const edge = path[i];
@@ -155,19 +154,8 @@ async function main() {
           if (result.extraSigners?.length) {
             extraSigners.push(...result.extraSigners);
           }
-          if (result.lookupTableAddresses?.length) {
-            for (const lut of result.lookupTableAddresses) {
-              try {
-                const pk = typeof lut === 'string' ? new PublicKey(lut) : lut;
-                const key = pk.toBase58();
-                if (!dexLookupSet.has(key)) {
-                  dexLookupSet.add(key);
-                  dexLookupTables.push(pk);
-                }
-              } catch (e) {
-                console.warn('[lut] skip invalid address', lut, (e as Error)?.message ?? e);
-              }
-            }
+          if (result.lookupTables?.length) {
+            dexLookupTables.push(...result.lookupTables);
           }
           amountIn = minOut;
         }

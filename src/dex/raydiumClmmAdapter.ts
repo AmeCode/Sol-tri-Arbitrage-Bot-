@@ -356,13 +356,21 @@ export function makeRayClmmEdge(
       });
 
       const rayIxs: TransactionInstruction[] = (bundle?.instructions ?? []) as TransactionInstruction[];
+      const rayLuts: PublicKey[] = ((bundle?.lookupTableAddress ?? []) as string[])
+        .filter((s) => !!s)
+        .map((s) => new PublicKey(s));
+
+      if (DEBUG && rayLuts.length) {
+        console.debug('[RayCLMM] LUTs from SDK (order matters!)', rayLuts.map((p) => p.toBase58()));
+      }
+
       if (!rayIxs.length) {
         throw new Error('raydium: ClmmInstrument returned no instructions');
       }
 
       return {
         ixs: [...setupIxs, ...rayIxs],
-        lookupTableAddresses: (bundle?.lookupTableAddress ?? []) as PublicKey[],
+        lookupTables: rayLuts,
       };
     },
   };

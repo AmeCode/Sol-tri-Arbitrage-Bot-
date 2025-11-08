@@ -8,7 +8,8 @@ export type Mint = string;
 export interface SwapInstructionBundle {
   ixs: TransactionInstruction[];
   extraSigners?: Keypair[];
-  lookupTableAddresses?: (PublicKey | string)[];
+  /** Optional: LUTs (as PublicKeys) that MUST be included (in order) when compiling a v0 message. */
+  lookupTables?: PublicKey[];
 }
 
 export interface PoolEdge {
