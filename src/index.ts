@@ -157,10 +157,15 @@ async function main() {
           }
           if (result.lookupTableAddresses?.length) {
             for (const lut of result.lookupTableAddresses) {
-              const key = lut.toBase58();
-              if (!dexLookupSet.has(key)) {
-                dexLookupSet.add(key);
-                dexLookupTables.push(lut);
+              try {
+                const pk = typeof lut === 'string' ? new PublicKey(lut) : lut;
+                const key = pk.toBase58();
+                if (!dexLookupSet.has(key)) {
+                  dexLookupSet.add(key);
+                  dexLookupTables.push(pk);
+                }
+              } catch (e) {
+                console.warn('[lut] skip invalid address', lut, (e as Error)?.message ?? e);
               }
             }
           }
