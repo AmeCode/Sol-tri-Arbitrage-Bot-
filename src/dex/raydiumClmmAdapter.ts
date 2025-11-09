@@ -267,10 +267,29 @@ export function makeRayClmmEdge(
       const instrumentInputMint = inputMintPk; // the actual input side
       const amountInBn = new BN(amountIn.toString());
       const minOutBn = new BN(minOut.toString());
-      const sqrtPriceLimitX64 =
-        instrumentInputMint.equals(mintA_pk)
+      // BEFORE calling the instrument, fetch the tick arrays (remainingAccounts)
+      // Raydium wants “byAmountIn” when you pass input amount.
+      // It returns the tick-array PDAs you must include in remainingAccounts.
+      const comp = await clmm.fetchComputeClmmInfo({
+        poolInfo,
+        poolKeys,
+        inputMint: instrumentInputMint,
+        amount: amountInBn,
+        byAmountIn: true,
+      });
+
+      // Some SDK builds return { remainingAccounts, sqrtPriceLimitX64? }
+      const computedRemaining = comp?.remainingAccounts ?? [];
+      const computedLimit =
+        comp?.sqrtPriceLimitX64 ??
+        (instrumentInputMint.equals(mintA_pk)
           ? MIN_SQRT_PRICE_X64.add(ONE)
-          : MAX_SQRT_PRICE_X64.sub(ONE);
+          : MAX_SQRT_PRICE_X64.sub(ONE));
+
+      // Sanity: CLMM swaps normally require ≥1 tick array; fail fast if none
+      if (computedRemaining.length === 0) {
+        throw new Error('raydium: no tick arrays returned for swap (remainingAccounts empty)');
+      }
 
       if (DEBUG) {
         console.debug('[RAY-CLMM buildSwapIx]', {
@@ -287,12 +306,15 @@ export function makeRayClmmEdge(
           inputMint: instrumentInputMint.toBase58(),
           amountIn: amountIn.toString(),
           minOut: minOut.toString(),
-          sqrtLimit: sqrtPriceLimitX64.toString(),
+          sqrtLimit: computedLimit.toString(),
           lut: poolKeys.lookupTableAccount ?? null,
+          remainingAccounts: computedRemaining.map((m: any) =>
+            m?.pubkey ? m.pubkey.toBase58?.() ?? String(m.pubkey) : String(m),
+          ),
         });
       }
 
-      // 7) Build swap instructions (remainingAccounts optional)
+      // 7) Build swap instructions with required remainingAccounts
       const bundle = ClmmInstrument.makeSwapBaseInInstructions({
         poolInfo,
         poolKeys,
@@ -301,8 +323,8 @@ export function makeRayClmmEdge(
         inputMint: instrumentInputMint,
         amountIn: amountInBn,
         amountOutMin: minOutBn,
-        sqrtPriceLimitX64,
-        remainingAccounts: [],
+        sqrtPriceLimitX64: computedLimit,
+        remainingAccounts: computedRemaining,
       });
 
       const rayIxs: TransactionInstruction[] =
