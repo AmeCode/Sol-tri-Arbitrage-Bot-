@@ -75,6 +75,15 @@ export const CFG = {
   cuLimit: Number(process.env.CU_LIMIT ?? 1_400_000),
   lutAddressEnv: process.env.LUT_ADDRESS ?? '',
   debugSim: String(process.env.DEBUG_SIM ?? 'false') === 'true',
+
+  mode: (process.env.MODE ?? 'simulate').toLowerCase() as 'simulate' | 'live',
+  useLut: (process.env.USE_LUT ?? 'true') === 'true',
+  lutAddresses: (process.env.LUT_ADDRESSES ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
+  requirePrealloc: (process.env.REQUIRE_PREALLOC ?? 'true') === 'true',
+  wsolPrewrap: (process.env.WSOL_PREWRAP ?? 'false') === 'true',
 };
 
 // Optional: one-time sanity logs
