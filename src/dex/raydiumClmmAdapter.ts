@@ -6,6 +6,7 @@ import {
   MIN_SQRT_PRICE_X64,
   MAX_SQRT_PRICE_X64,
   ONE,
+  PoolUtils,
 } from '@raydium-io/raydium-sdk-v2';
 
 import { rayIndex } from '../initRay.js';
@@ -270,7 +271,7 @@ export function makeRayClmmEdge(
       // 5) Amounts & price limits
       const instrumentInputMint = inputMintPk; // the actual input side
       const amountInBn = new BN(amountIn.toString());
-      const minOutBn = new BN(minOut.toString());
+      const routeMinOutBn = new BN(minOut.toString());
       const sqrtPriceLimitX64 =
         instrumentInputMint.equals(mintA_pk)
           ? MIN_SQRT_PRICE_X64.add(ONE)
@@ -296,6 +297,40 @@ export function makeRayClmmEdge(
         });
       }
 
+      const computePoolInfo = await PoolUtils.fetchComputeClmmInfo({
+        connection,
+        poolInfo: poolInfo as any,
+      });
+      const { ammConfig: _ignoredAmmConfig, ...poolKeysForTickArray } = computePoolInfo as any;
+      const tickArrayCaches = await PoolUtils.fetchMultiplePoolTickArrays({
+        connection,
+        poolKeys: [poolKeysForTickArray] as any,
+      });
+      const poolIdKey = computePoolInfo.id.toString();
+      const tickArrayCache = tickArrayCaches[poolIdKey] ?? {};
+      const epochInfo = await connection.getEpochInfo();
+      const tokenOutInfo =
+        direction === 'AtoB' ? computePoolInfo.mintB : computePoolInfo.mintA;
+      const computeAmountOut = PoolUtils.computeAmountOutFormat({
+        poolInfo: computePoolInfo,
+        tickArrayCache,
+        amountIn: amountInBn,
+        tokenOut: tokenOutInfo,
+        slippage: 0,
+        epochInfo,
+      });
+      const remainingAccounts = computeAmountOut.remainingAccounts ?? [];
+      const computedMinOutBn = new BN(computeAmountOut.minAmountOut.amount.raw);
+      const minOutBn = routeMinOutBn.gt(computedMinOutBn)
+        ? routeMinOutBn
+        : computedMinOutBn;
+
+      console.log(
+        '[ray-clmm] remaining tick arrays',
+        remainingAccounts.map((pk) => pk.toBase58()),
+      );
+      console.log('[ray-clmm] min amount out (raw)', minOutBn.toString());
+
       // 7) Build swap instructions (remainingAccounts optional)
       const bundle = ClmmInstrument.makeSwapBaseInInstructions({
         poolInfo,
@@ -306,7 +341,7 @@ export function makeRayClmmEdge(
         amountIn: amountInBn,
         amountOutMin: minOutBn,
         sqrtPriceLimitX64,
-        remainingAccounts: [],
+        remainingAccounts,
       });
 
       const rayIxs: TransactionInstruction[] =
@@ -315,8 +350,16 @@ export function makeRayClmmEdge(
         throw new Error('raydium: ClmmInstrument returned no instructions');
       }
 
-      const lookupTables = poolKeys.lookupTableAccount
-        ? [new PublicKey(poolKeys.lookupTableAccount)]
+      const lookupTables = Array.isArray(bundle?.lookupTableAddress)
+        ? (bundle.lookupTableAddress as any[])
+            .map((addr) => {
+              try {
+                return new PublicKey(addr);
+              } catch {
+                return null;
+              }
+            })
+            .filter((pk): pk is PublicKey => pk !== null)
         : [];
 
       return { ixs: [...setupIxs, ...rayIxs], lookupTables };

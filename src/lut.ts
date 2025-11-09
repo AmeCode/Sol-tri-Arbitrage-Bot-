@@ -190,25 +190,30 @@ export async function buildV0WithLut(params: {
   const finalInstructions = [...pre, ...instructions];
 
   const dexLutAccounts: AddressLookupTableAccount[] = [];
-  const fetchedDex = new Map<string, AddressLookupTableAccount>();
+  const dexKeysUsed: string[] = [];
+  const seenDex = new Set<string>();
   for (const pk of dexLookupTables) {
     const key = pk.toBase58();
-    let acc = fetchedDex.get(key) ?? null;
+    if (seenDex.has(key)) continue;
+    seenDex.add(key);
+    const acc = (await connection.getAddressLookupTable(pk)).value;
     if (!acc) {
-      acc = (await connection.getAddressLookupTable(pk)).value;
-      if (!acc) {
-        throw new Error(`LUT not found on chain: ${key}`);
-      }
-      fetchedDex.set(key, acc);
+      console.warn(`[lut] missing lookup table ${key}`);
+      continue;
     }
     dexLutAccounts.push(acc);
+    dexKeysUsed.push(acc.key.toBase58());
   }
 
   let appLutAcc: AddressLookupTableAccount | null = null;
+  let appLutKey: string | null = null;
   if (lutAddress) {
-    appLutAcc = (await connection.getAddressLookupTable(lutAddress)).value;
+    const fetched = await connection.getAddressLookupTable(lutAddress);
+    appLutAcc = fetched.value;
     if (!appLutAcc) {
-      throw new Error(`LUT not found on chain: ${lutAddress.toBase58()}`);
+      console.warn(`[lut] missing lookup table ${lutAddress.toBase58()}`);
+    } else {
+      appLutKey = appLutAcc.key.toBase58();
     }
   }
 
@@ -218,6 +223,11 @@ export async function buildV0WithLut(params: {
     recentBlockhash: blockhash,
     instructions: finalInstructions,
   }).compileToV0Message(appLutAcc ? [...dexLutAccounts, appLutAcc] : dexLutAccounts);
+
+  const usedKeys = [...dexKeysUsed, ...(appLutKey ? [appLutKey] : [])];
+  if (usedKeys.length > 0) {
+    console.log('[lut] using tables', usedKeys);
+  }
 
   return new VersionedTransaction(msg);
 }
