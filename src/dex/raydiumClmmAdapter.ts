@@ -319,7 +319,9 @@ export function makeRayClmmEdge(
         slippage: 0,
         epochInfo,
       });
-      const remainingAccounts = computeAmountOut.remainingAccounts ?? [];
+      const remainingAccounts = (
+        computeAmountOut.remainingAccounts ?? []
+      ) as PublicKey[];
       const computedMinOutBn = new BN(computeAmountOut.minAmountOut.amount.raw);
       const minOutBn = routeMinOutBn.gt(computedMinOutBn)
         ? routeMinOutBn
