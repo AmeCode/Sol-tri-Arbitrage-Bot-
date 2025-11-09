@@ -1,14 +1,16 @@
 import {
+  AddressLookupTableAccount,
   ComputeBudgetProgram,
   Connection,
   PublicKey,
   Signer,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
   VersionedTransaction,
 } from '@solana/web3.js';
 import { CFG } from './config.js';
-import { buildV0WithLut, ensureLutHas } from './lut.js';
+import { ensureLutHas } from './lut.js';
 import { assertNoUnwhitelistedAllocations } from './txGuards.js';
 import { sanitizeWithSignerWhitelist } from './txSanitize.js';
 
@@ -21,6 +23,42 @@ export function getRuntimeLutAddress(): PublicKey | null {
 }
 export function setRuntimeLutAddress(addr: PublicKey) {
   runtimeLutAddress = addr;
+}
+
+async function resolveLookupTables(
+  connection: Connection,
+  addrs: string[],
+): Promise<{
+  accounts: AddressLookupTableAccount[];
+  missing: string[];
+  stale: string[];
+}> {
+  const accounts: AddressLookupTableAccount[] = [];
+  const missing: string[] = [];
+  const stale: string[] = [];
+  for (const addr of addrs) {
+    let key: PublicKey;
+    try {
+      key = new PublicKey(addr);
+    } catch (e) {
+      console.warn('[lut] invalid LUT address', addr, e);
+      missing.push(addr);
+      continue;
+    }
+    const acc = (await connection.getAddressLookupTable(key)).value;
+    if (!acc) {
+      console.warn('[lut] skip missing LUT', addr);
+      missing.push(addr);
+      continue;
+    }
+    if (typeof acc.isActive === 'function' && !acc.isActive()) {
+      console.warn('[lut] skip stale LUT', addr);
+      stale.push(addr);
+      continue;
+    }
+    accounts.push(acc);
+  }
+  return { accounts, missing, stale };
 }
 
 export function withComputeBudget(
@@ -100,19 +138,70 @@ export async function buildAndMaybeLut(
     );
     runtimeLutAddress = ensured;
   }
-  const tx = await buildV0WithLut({
+  const lutAddressOrder: string[] = [];
+  const seen = new Set<string>();
+  for (const pk of dexLookupTables) {
+    const s = pk.toBase58();
+    if (!seen.has(s)) {
+      seen.add(s);
+      lutAddressOrder.push(s);
+    }
+  }
+  if (includeRuntimeLut && ensured) {
+    const runtimeKey = ensured.toBase58();
+    if (!seen.has(runtimeKey)) {
+      seen.add(runtimeKey);
+      lutAddressOrder.push(runtimeKey);
+    }
+  }
+
+  const { accounts: lutAccounts, missing, stale } = await resolveLookupTables(
     connection,
-    payer,
-    lutAddress: includeRuntimeLut && ensured ? ensured : undefined,
-    dexLookupTables,
-    cuLimit: targetCuLimit,
-    cuPriceMicroLamports,
-    instructions: sanitized,
+    lutAddressOrder,
+  );
+  const hadFailures = missing.length > 0 || stale.length > 0;
+  const forcedNoLut = process.env.NO_DEX_LUT === '1';
+  const useNoLut = forcedNoLut || lutAccounts.length === 0 || hadFailures;
+
+  if (forcedNoLut) {
+    console.warn('[lut] NO_DEX_LUT=1 forcing legacy compile');
+  } else if (hadFailures) {
+    console.warn('[lut] falling back to legacy compile', {
+      missing,
+      stale,
+    });
+  }
+
+  const { blockhash } = await connection.getLatestBlockhash();
+  const message = new TransactionMessage({
+    payerKey: payer,
+    recentBlockhash: blockhash,
+    instructions: withCb,
   });
+
+  if (useNoLut) {
+    const legacyMsg = message.compileToLegacyMessage();
+    return {
+      kind: 'v0',
+      tx: new VersionedTransaction(legacyMsg),
+      lutAddressUsed: undefined,
+    };
+  }
+
+  const v0Msg = message.compileToV0Message(lutAccounts);
+  const usedKeys = lutAccounts.map((acc) => acc.key.toBase58());
+  if (usedKeys.length > 0) {
+    console.log('[lut] using tables', usedKeys);
+  }
+
+  const runtimeUsed =
+    includeRuntimeLut &&
+    ensured &&
+    lutAccounts.some((acc) => acc.key.equals(ensured));
 
   return {
     kind: 'v0',
-    tx,
-    lutAddressUsed: includeRuntimeLut && ensured ? ensured : undefined,
+    tx: new VersionedTransaction(v0Msg),
+    lutAddressUsed: runtimeUsed ? ensured! : undefined,
   };
 }
