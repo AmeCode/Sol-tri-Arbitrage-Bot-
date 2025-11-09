@@ -1,15 +1,23 @@
-import { PublicKey } from '@solana/web3.js';
-import type { SwapInstructionBundle } from '../graph/types.js';
+import { AddressLookupTableAccount, PublicKey, TransactionInstruction } from '@solana/web3.js';
+import BN from 'bn.js';
 
-export interface DexAdapterEdge {
-  id: string;
+type BNType = InstanceType<typeof BN>;
+
+export type Quote = {
+  amountIn: BNType;
+  amountOut: BNType;
+  fee: BNType;
+  minOut: BNType;
+};
+
+export type BuildIxResult = {
+  ixs: TransactionInstruction[];
+  lookupTables?: AddressLookupTableAccount[];
+};
+
+export interface DexEdge {
   from: string;
   to: string;
-  feeBps: number;
-  quoteOut(amountIn: bigint): Promise<bigint>;
-  buildSwapIx(
-    amountIn: bigint,
-    minOut: bigint,
-    user: PublicKey,
-  ): Promise<SwapInstructionBundle>;
+  quote(amountIn: BNType, user: PublicKey): Promise<Quote>;
+  buildSwapIx(amountIn: BNType, minOut: BNType, user: PublicKey): Promise<BuildIxResult>;
 }

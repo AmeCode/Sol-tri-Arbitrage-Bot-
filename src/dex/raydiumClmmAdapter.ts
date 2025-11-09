@@ -1,5 +1,4 @@
 // src/dex/raydiumClmmAdapter.ts
-import { strict as assert } from 'assert';
 import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
 import BN from 'bn.js';
 import {
@@ -12,9 +11,11 @@ import { rayIndex } from '../initRay.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { isTradable } from '../ray/clmmIndex.js';
 import { ensureAtaIx } from '../tokenAta.js';
-import { RUNTIME } from '../runtime.js';
 import { mustAccount } from '../onchain/assertions.js';
 import { AccountLayout } from '@solana/spl-token';
+import { DexEdge, Quote, BuildIxResult } from './types.js';
+import { IS_SIM } from '../runtime.js';
+import { PoolUtils } from '@raydium-io/raydium-sdk-v2';
 
 // We import these types only to annotate shapes clearly
 // (no runtime import)
@@ -42,7 +43,46 @@ type ClmmKeys = {
   [k: string]: unknown;
 };
 
+type BNType = InstanceType<typeof BN>;
+
 const DEBUG = process.env.RAY_CLMM_DEBUG === '1';
+const DEFAULT_SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS ?? '50');
+
+function toBN(value: BNType | bigint): BNType {
+  return BN.isBN(value) ? (value as BNType) : new BN(value.toString());
+}
+
+async function ensureAtaPresent(
+  connection: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+  label: string,
+): Promise<PublicKey> {
+  const ensured = ensureAtaIx(owner, owner, mint);
+  if (ensured.ixs.length) {
+    throw new Error(
+      `${label}: missing ATA ${ensured.ata.toBase58()} — run scripts/one_time_setup.ts to create it once`,
+    );
+  }
+  await mustAccount(connection, ensured.ata, label);
+  return ensured.ata;
+}
+
+async function assertInputBalance(
+  connection: Connection,
+  ata: PublicKey,
+  amount: BNType,
+  label: string,
+) {
+  const info = await mustAccount(connection, ata, label);
+  const decoded = AccountLayout.decode(info.data);
+  const available = BigInt(decoded.amount.toString());
+  if (available < BigInt(amount.toString())) {
+    throw new Error(
+      `${label}: ${ata.toBase58()} has ${available} but needs ${amount.toString()} — top up before trading`,
+    );
+  }
+}
 
 /* -------------------------------- helpers -------------------------------- */
 
@@ -157,7 +197,7 @@ export function makeRayClmmEdge(
   poolId: string,
   mintA: string,
   mintB: string,
-): PoolEdge {
+): PoolEdge & DexEdge {
   const configuredId = new PublicKey(poolId).toBase58();
 
   async function resolvePoolId(): Promise<string> {
@@ -194,162 +234,159 @@ export function makeRayClmmEdge(
     return (p.id || p.pool_id)!;
   }
 
-  return {
+  async function buildLiveSwap(
+    amountIn: BNType,
+    minOut: BNType,
+    user: PublicKey,
+  ): Promise<{ bundle: SwapInstructionBundle; liveResult: BuildIxResult }> {
+    if (IS_SIM) {
+      throw new Error('buildSwapIx called in simulate mode; use quote() only.');
+    }
+
+    const id = await resolvePoolId();
+    const apiItem = await ensureApiPoolInfoForClmm(id);
+    const poolInfo: ApiV3PoolInfoConcentratedItem = {
+      id: apiItem.id,
+      programId: apiItem.programId,
+      type: 'Concentrated',
+      mintA: { address: apiItem.mintA.address },
+      mintB: { address: apiItem.mintB.address },
+      config: { id: apiItem.config.id },
+    };
+
+    const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection);
+    const poolKeys: ClmmKeys = await clmm.getClmmPoolKeys(id);
+    if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
+      throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`);
+    }
+
+    const observationId = new PublicKey(poolKeys.observationId);
+
+    const mintA_pk = mustPk(poolInfo.mintA.address, 'poolInfo.mintA.address');
+    const mintB_pk = mustPk(poolInfo.mintB.address, 'poolInfo.mintB.address');
+
+    const inputMintPk = new PublicKey(edge.from);
+    const outputMintPk = new PublicKey(edge.to);
+    const direction =
+      inputMintPk.equals(mintA_pk) && outputMintPk.equals(mintB_pk)
+        ? 'AtoB'
+        : inputMintPk.equals(mintB_pk) && outputMintPk.equals(mintA_pk)
+        ? 'BtoA'
+        : null;
+    if (!direction) {
+      throw new Error(
+        `Input/output mint mismatch for Raydium CLMM pool; edge.from=${inputMintPk.toBase58()} edge.to=${outputMintPk.toBase58()}`,
+      );
+    }
+
+    const tokenAccountA = await ensureAtaPresent(
+      connection,
+      user,
+      mintA_pk,
+      'live: raydium mintA ATA',
+    );
+    const tokenAccountB = await ensureAtaPresent(
+      connection,
+      user,
+      mintB_pk,
+      'live: raydium mintB ATA',
+    );
+
+    const inputAta = direction === 'AtoB' ? tokenAccountA : tokenAccountB;
+    await assertInputBalance(connection, inputAta, amountIn, 'live: raydium source ATA');
+
+    const ownerInfo = { wallet: user, tokenAccountA, tokenAccountB };
+    const instrumentInputMint = inputMintPk;
+    const sqrtPriceLimitX64 =
+      instrumentInputMint.equals(mintA_pk) ? MIN_SQRT_PRICE_X64.add(ONE) : MAX_SQRT_PRICE_X64.sub(ONE);
+
+    if (DEBUG) {
+      console.debug('[RAY-CLMM buildSwapIx]', {
+        poolId: id,
+        observationId: observationId.toBase58(),
+        wallet: user.toBase58(),
+        mintA: mintA_pk.toBase58(),
+        mintB: mintB_pk.toBase58(),
+        tokenAccountA: tokenAccountA.toBase58(),
+        tokenAccountB: tokenAccountB.toBase58(),
+        direction,
+        amountIn: amountIn.toString(),
+        minOut: minOut.toString(),
+        sqrtLimit: sqrtPriceLimitX64.toString(),
+      });
+    }
+
+    const bundle = ClmmInstrument.makeSwapBaseInInstructions({
+      poolInfo,
+      poolKeys,
+      observationId,
+      ownerInfo,
+      inputMint: instrumentInputMint,
+      amountIn,
+      amountOutMin: minOut,
+      sqrtPriceLimitX64,
+      remainingAccounts: [],
+    });
+
+    const rayIxs: TransactionInstruction[] =
+      (bundle?.instructions ?? []) as TransactionInstruction[];
+    if (!rayIxs.length) {
+      throw new Error('raydium: ClmmInstrument returned no instructions');
+    }
+
+    const swapBundle: SwapInstructionBundle = { ixs: rayIxs, lookupTables: [] };
+    const liveResult: BuildIxResult = { ixs: rayIxs };
+    return { bundle: swapBundle, liveResult };
+  }
+
+  const edge: any = {
     id: `ray:${configuredId}`,
     from: mintA,
     to: mintB,
     feeBps: 0,
 
-    async quoteOut(amountIn: bigint): Promise<bigint> {
-      if (amountIn <= 0n) throw new Error('raydium: non-positive amountIn');
-      // Plug a real quote here if you wish; pass-through keeps router logic alive.
-      return amountIn;
+    async quote(amountIn: BNType, _user: PublicKey): Promise<Quote> {
+      if (amountIn.lte(new BN(0))) throw new Error('raydium: non-positive amountIn');
+      const id = await resolvePoolId();
+      const { clmm } = await loadClmmTools(connection);
+      const { computePoolInfo, tickData } = await clmm.getPoolInfoFromRpc(id);
+      const inputMintPk = new PublicKey(this.from);
+      const sqrtLimit = inputMintPk.equals(new PublicKey(computePoolInfo.mintA.address))
+        ? MIN_SQRT_PRICE_X64.add(ONE)
+        : MAX_SQRT_PRICE_X64.sub(ONE);
+      const tickCache = tickData[id];
+      if (!tickCache) throw new Error(`raydium: tick cache missing for ${id}`);
+      const { expectedAmountOut, feeAmount } = PoolUtils.getOutputAmountAndRemainAccounts(
+        computePoolInfo,
+        tickCache,
+        inputMintPk,
+        amountIn,
+        sqrtLimit,
+        true,
+      );
+      const slippageBps = DEFAULT_SLIPPAGE_BPS;
+      const amountOut = expectedAmountOut as BNType;
+      const fee = feeAmount as BNType;
+      const minOut = amountOut.muln(10_000 - slippageBps).divn(10_000) as BNType;
+      return { amountIn, amountOut, fee, minOut };
     },
 
-    async buildSwapIx(
-      amountIn: bigint,
-      minOut: bigint,
-      user: PublicKey,
-    ): Promise<SwapInstructionBundle> {
-      assert(amountIn > 0n, 'amountIn must be > 0');
-      assert(minOut >= 0n, 'minOut must be >= 0');
+    async quoteOut(amountIn: bigint): Promise<bigint> {
+      const result = await this.quote(toBN(amountIn), PublicKey.default);
+      return BigInt(result.amountOut.toString());
+    },
 
-      const id = await resolvePoolId();
-
-      // 1) API JSON → poolInfo (minimal Pick<>)
-      const apiItem = await ensureApiPoolInfoForClmm(id);
-      const poolInfo: ApiV3PoolInfoConcentratedItem = {
-        id: apiItem.id,
-        programId: apiItem.programId,
-        type: 'Concentrated',
-        mintA: { address: apiItem.mintA.address },
-        mintB: { address: apiItem.mintB.address },
-        config: { id: apiItem.config.id },
-      };
-
-      // 2) On-chain keys → poolKeys (vaults/obs/lookupTable)
-      const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection);
-      const poolKeys: ClmmKeys = await clmm.getClmmPoolKeys(id);
-      if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
-        throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`);
+    async buildSwapIx(amountIn: BNType | bigint, minOut: BNType | bigint, user: PublicKey): Promise<any> {
+      const amountBn = toBN(amountIn as BNType | bigint);
+      const minOutBn = toBN(minOut as BNType | bigint);
+      const result = await buildLiveSwap(amountBn, minOutBn, user);
+      if (BN.isBN(amountIn) || BN.isBN(minOut)) {
+        return result.liveResult;
       }
-
-      const observationId = new PublicKey(poolKeys.observationId);
-
-      // Validate keys we need
-      const mintA_pk = mustPk(poolInfo.mintA.address, 'poolInfo.mintA.address');
-      const mintB_pk = mustPk(poolInfo.mintB.address, 'poolInfo.mintB.address');
-      const vaultA_pk = mustPk(poolKeys.vault?.A, 'poolKeys.vault.A');
-      const vaultB_pk = mustPk(poolKeys.vault?.B, 'poolKeys.vault.B');
-
-      // 3) Direction & input mint (based on edge.from/edge.to)
-      const inputMintPk = new PublicKey(this.from);
-      const outputMintPk = new PublicKey(this.to);
-      const direction =
-        inputMintPk.equals(mintA_pk) && outputMintPk.equals(mintB_pk)
-          ? 'AtoB'
-          : inputMintPk.equals(mintB_pk) && outputMintPk.equals(mintA_pk)
-          ? 'BtoA'
-          : null;
-      if (!direction) {
-        throw new Error(
-          `Input/output mint mismatch for Raydium CLMM pool; ` +
-          `edge.from=${inputMintPk.toBase58()} edge.to=${outputMintPk.toBase58()} ` +
-          `pool.mintA=${mintA_pk.toBase58()} pool.mintB=${mintB_pk.toBase58()}`
-        );
-      }
-
-      // 4) Ensure ATAs for both pool mints; map to tokenAccountA/B
-      const setupIxs: TransactionInstruction[] = [];
-      const ensuredA = ensureAtaIx(user, user, mintA_pk);
-      const ensuredB = ensureAtaIx(user, user, mintB_pk);
-      let mintAInfo: Awaited<ReturnType<typeof mustAccount>> | null = null;
-      let mintBInfo: Awaited<ReturnType<typeof mustAccount>> | null = null;
-
-      if (RUNTIME.mode === 'live') {
-        if (ensuredA.ixs.length) setupIxs.push(...ensuredA.ixs);
-        if (ensuredB.ixs.length) setupIxs.push(...ensuredB.ixs);
-      } else if (RUNTIME.requirePrealloc) {
-        mintAInfo = await mustAccount(connection, ensuredA.ata, 'simulate: raydium mintA ATA');
-        mintBInfo = await mustAccount(connection, ensuredB.ata, 'simulate: raydium mintB ATA');
-      }
-
-      const tokenAccountA = ensuredA.ata;
-      const tokenAccountB = ensuredB.ata;
-
-      if (RUNTIME.mode === 'simulate' && RUNTIME.requirePrealloc) {
-        const inputAta = direction === 'AtoB' ? tokenAccountA : tokenAccountB;
-        const outputAta = direction === 'AtoB' ? tokenAccountB : tokenAccountA;
-        const inputInfo =
-          direction === 'AtoB'
-            ? mintAInfo ?? (await mustAccount(connection, inputAta, 'simulate: raydium input ATA'))
-            : mintBInfo ?? (await mustAccount(connection, inputAta, 'simulate: raydium input ATA'));
-        const decoded = AccountLayout.decode(inputInfo.data);
-        const available = BigInt(decoded.amount.toString());
-        if (available < amountIn) {
-          throw new Error(
-            `simulate: raydium input ATA ${inputAta.toBase58()} has ${available}, needs ${amountIn}`,
-          );
-        }
-        await mustAccount(connection, outputAta, 'simulate: raydium output ATA');
-      }
-
-      const ownerInfo = { wallet: user, tokenAccountA, tokenAccountB };
-
-      // 5) Amounts & price limits
-      const instrumentInputMint = inputMintPk; // the actual input side
-      const amountInBn = new BN(amountIn.toString());
-      const minOutBn = new BN(minOut.toString());
-      const sqrtPriceLimitX64 =
-        instrumentInputMint.equals(mintA_pk)
-          ? MIN_SQRT_PRICE_X64.add(ONE)
-          : MAX_SQRT_PRICE_X64.sub(ONE);
-
-      if (DEBUG) {
-        console.debug('[RAY-CLMM buildSwapIx]', {
-          poolId: id,
-          observationId: observationId.toBase58(),
-          wallet: user.toBase58(),
-          mintA: mintA_pk.toBase58(),
-          mintB: mintB_pk.toBase58(),
-          vaultA: vaultA_pk.toBase58(),
-          vaultB: vaultB_pk.toBase58(),
-          tokenAccountA: tokenAccountA.toBase58(),
-          tokenAccountB: tokenAccountB.toBase58(),
-          direction,
-          inputMint: instrumentInputMint.toBase58(),
-          amountIn: amountIn.toString(),
-          minOut: minOut.toString(),
-          sqrtLimit: sqrtPriceLimitX64.toString(),
-          lut: poolKeys.lookupTableAccount ?? null,
-        });
-      }
-
-      // 7) Build swap instructions (remainingAccounts optional)
-      const bundle = ClmmInstrument.makeSwapBaseInInstructions({
-        poolInfo,
-        poolKeys,
-        observationId,
-        ownerInfo,
-        inputMint: instrumentInputMint,
-        amountIn: amountInBn,
-        amountOutMin: minOutBn,
-        sqrtPriceLimitX64,
-        remainingAccounts: [],
-      });
-
-      const rayIxs: TransactionInstruction[] =
-        (bundle?.instructions ?? []) as TransactionInstruction[];
-      if (!rayIxs.length) {
-        throw new Error('raydium: ClmmInstrument returned no instructions');
-      }
-
-      const lookupTables = poolKeys.lookupTableAccount
-        ? [new PublicKey(poolKeys.lookupTableAccount)]
-        : [];
-
-      return { ixs: [...setupIxs, ...rayIxs], lookupTables };
+      return result.bundle;
     },
   };
+
+  return edge as PoolEdge & DexEdge;
 }
 
