@@ -1,153 +1,160 @@
 // src/dex/raydiumClmmAdapter.ts
-import { strict as assert } from 'assert';
-import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
-import BN from 'bn.js';
+import { strict as assert } from 'assert'
+import {
+  Connection,
+  PublicKey,
+  TransactionInstruction,
+} from '@solana/web3.js'
+import BN from 'bn.js'
+
 import {
   MIN_SQRT_PRICE_X64,
   MAX_SQRT_PRICE_X64,
   ONE,
-} from '@raydium-io/raydium-sdk-v2';
+} from '@raydium-io/raydium-sdk-v2'
 
-import { rayIndex } from '../initRay.js';
-import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
-import { isTradable } from '../ray/clmmIndex.js';
-import { ensureAtaIx } from '../tokenAta.js';
+import { rayIndex } from '../initRay.js'
+import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js'
+import { isTradable, normMintA, normMintB } from '../ray/clmmIndex.js'
+import { ensureAtaIx } from '../tokenAta.js'
 
-// We import these types only to annotate shapes clearly
-// (no runtime import)
-type ApiClmmConfigV3 = {
-  id: string;
-  [k: string]: unknown;
-};
-type ApiV3PoolInfoConcentratedItem = {
-  id: string;
-  programId: string;
-  type: 'Concentrated';
-  mintA: { address: string };
-  mintB: { address: string };
-  config: ApiClmmConfigV3;
-};
-type ClmmKeys = {
-  id: string;
-  programId: string;
-  mintA: { address: string };
-  mintB: { address: string };
-  vault: { A: string; B: string };
-  observationId: string;
-  lookupTableAccount?: string;
-  config: ApiClmmConfigV3;
-  [k: string]: unknown;
-};
+const DEBUG = process.env.RAY_CLMM_DEBUG === '1'
 
-const DEBUG = process.env.RAY_CLMM_DEBUG === '1';
-
-/* -------------------------------- helpers -------------------------------- */
-
+/** Robust PublicKey coercion with clear error messages. */
 function mustPk(v: string | PublicKey | undefined, label: string): PublicKey {
-  if (!v) throw new Error(`raydium: ${label} missing`);
+  if (!v) throw new Error(`raydium: ${label} missing`)
   try {
-    // @ts-ignore
-    return new PublicKey(v);
+    // PublicKey ctor accepts both strings and PublicKey; normalize either.
+    // @ts-ignore – ctor overload handles both correctly
+    return new PublicKey(v)
   } catch {
-    throw new Error(`raydium: ${label} invalid: ${String(v)}`);
+    throw new Error(`raydium: ${label} invalid: ${String(v)}`)
   }
 }
 
+/** GET a Raydium API v3 CLMM pool JSON by id. Requires Node 18+ global fetch. */
 async function fetchApiPoolById(id: string): Promise<any | null> {
-  const url = `https://api-v3.raydium.io/pools/info/ids?ids=${encodeURIComponent(id)}`;
-  let res: Response | null = null;
-  try {
-    res = await fetch(url, { headers: { accept: 'application/json' } });
-  } catch (e: any) {
-    console.warn('[ray-api] fetch error', e?.message ?? e);
-    return null;
+  const url = `https://api-v3.raydium.io/pools/info/ids?ids=${encodeURIComponent(id)}`
+  const res = await fetch(url, { method: 'GET', headers: { accept: 'application/json' } }).catch((e) => {
+    console.warn('[ray-api] fetch error', e?.message ?? e)
+    return null as any
+  })
+  if (!res || !res.ok) {
+    console.warn('[ray-api] fetch by id failed', id, res?.status)
+    return null
   }
-  if (!res?.ok) {
-    console.warn('[ray-api] fetch by id failed', id, res?.status);
-    return null;
-  }
-  const json = await res.json().catch(() => null);
-  const list = (json?.data ?? json) as any[];
-  if (!Array.isArray(list) || list.length === 0) return null;
-  return list.find((x) => (x?.id ?? x?.pool_id) === id) ?? list[0] ?? null;
+  const json = await res.json().catch(() => null)
+  const list = (json?.data ?? json) as any[]
+  if (!Array.isArray(list) || list.length === 0) return null
+  // Prefer exact id, otherwise first item
+  return list.find((x) => (x?.id ?? x?.pool_id) === id) ?? list[0] ?? null
 }
 
-async function ensureApiPoolInfoForClmm(resolvedId: string): Promise<ApiV3PoolInfoConcentratedItem> {
+/**
+ * Ensure we have an API v3 CLMM JSON object with the fields
+ * required by the SDK instrument (id, programId, mintA.address, mintB.address, config.id).
+ */
+async function ensureApiPoolInfoForClmm(resolvedId: string): Promise<any> {
+  // Try local cache/index first
   let apiItem: any =
     rayIndex.getById(resolvedId) ||
-    (await rayIndex.fetchByIdAndCache(resolvedId));
+    (await rayIndex.fetchByIdAndCache(resolvedId))
 
+  // Check if it looks like a proper concentrated pool JSON
   const looksLikeClmm =
     apiItem &&
     (apiItem.type === 'Concentrated' ||
       apiItem.pooltype === 'Concentrated' ||
-      apiItem.category === 'concentrated');
+      apiItem.category === 'concentrated')
 
   const hasMints =
     !!(apiItem?.mintA?.address ?? apiItem?.mintA) &&
-    !!(apiItem?.mintB?.address ?? apiItem?.mintB);
+    !!(apiItem?.mintB?.address ?? apiItem?.mintB)
 
   const hasProgramAndId =
     !!(apiItem?.programId ?? apiItem?.program_id) &&
-    !!(apiItem?.id ?? apiItem?.pool_id);
+    !!(apiItem?.id ?? apiItem?.pool_id)
 
+  // Fetch from API if the cached one is missing pieces
   if (!looksLikeClmm || !hasMints || !hasProgramAndId) {
-    const fetched = await fetchApiPoolById(resolvedId);
-    if (!fetched) {
-      throw new Error(`raydium: could not fetch API v3 CLMM info for ${resolvedId}`);
+    if (DEBUG) {
+      console.warn('[ray-api] local item incomplete → fetching v3', {
+        id: resolvedId,
+        looksLikeClmm,
+        hasMints,
+        hasProgramAndId,
+      })
     }
-    apiItem = fetched;
+    const fetched = await fetchApiPoolById(resolvedId)
+    if (!fetched) {
+      throw new Error(
+        `raydium: could not fetch API v3 CLMM info for ${resolvedId}`
+      )
+    }
+    apiItem = fetched
   }
 
-  const normalized: ApiV3PoolInfoConcentratedItem = {
-    id: String(apiItem.id ?? apiItem.pool_id),
-    programId: String(apiItem.programId ?? apiItem.program_id),
-    type: 'Concentrated',
+  // Normalize to the exact shape the instrument expects
+  const normalized = {
+    ...apiItem,
+    id: apiItem.id ?? apiItem.pool_id,
+    programId: apiItem.programId ?? apiItem.program_id,
+    // ensure nested objects exist
     mintA:
       typeof apiItem.mintA === 'object'
-        ? { address: apiItem.mintA.address }
-        : { address: String(apiItem.mintA) },
+        ? apiItem.mintA
+        : { address: apiItem.mintA },
     mintB:
       typeof apiItem.mintB === 'object'
-        ? { address: apiItem.mintB.address }
-        : { address: String(apiItem.mintB) },
+        ? apiItem.mintB
+        : { address: apiItem.mintB },
     config:
-      typeof apiItem.config === 'object' && apiItem.config?.id
-        ? { id: String(apiItem.config.id) }
-        : apiItem.config_id
-        ? { id: String(apiItem.config_id) }
-        : { id: String(apiItem.config) },
-  };
-
-  if (!normalized.id || !normalized.programId || !normalized.mintA?.address || !normalized.mintB?.address) {
-    console.error('[ray-api] normalized item missing fields', normalized);
-    throw new Error('raydium: normalized API CLMM item missing required fields');
+      typeof apiItem.config === 'object'
+        ? apiItem.config
+        : apiItem?.config
+        ? { id: apiItem.config }
+        : apiItem?.config_id
+        ? { id: apiItem.config_id }
+        : undefined,
+    type: apiItem.type ?? apiItem.pooltype ?? 'Concentrated',
   }
 
-  return normalized;
+  if (
+    !normalized.id ||
+    !normalized.programId ||
+    !normalized.mintA?.address ||
+    !normalized.mintB?.address ||
+    !normalized.config?.id
+  ) {
+    console.error('[ray-api] normalized CLMM item missing fields', normalized)
+    throw new Error('raydium: normalized API CLMM item missing required fields')
+  }
+
+  return normalized
 }
 
-type ClmmTools = { clmm: any; instrument: any };
-
-const sdkModulePromise = import('@raydium-io/raydium-sdk-v2');
-const clmmClientCache = new WeakMap<Connection, Promise<ClmmTools>>();
-
+// Lazy SDK loader bound per connection (keep both clmm & instrument!)
+type ClmmTools = { clmm: any; instrument: any }
+const sdkModulePromise = import('@raydium-io/raydium-sdk-v2')
+const clmmClientCache = new WeakMap<Connection, Promise<ClmmTools>>()
 async function loadClmmTools(connection: Connection): Promise<ClmmTools> {
-  let cached = clmmClientCache.get(connection);
+  let cached = clmmClientCache.get(connection)
   if (!cached) {
     cached = (async () => {
-      const { Raydium, Clmm, Api, ClmmInstrument } = await sdkModulePromise;
-      const api = new Api({ cluster: 'mainnet' });
-      const raydium = new Raydium({ connection, api });
-      const clmm = new Clmm({ scope: raydium, moduleName: 'Clmm' });
-      return { clmm, instrument: ClmmInstrument };
-    })();
-    clmmClientCache.set(connection, cached);
+      const { Raydium, Clmm, Api, ClmmInstrument } = await sdkModulePromise
+      const api = new Api({ cluster: 'mainnet' })
+      const raydium = new Raydium({ connection, api })
+      const clmm = new Clmm({ scope: raydium, moduleName: 'Clmm' })
+      return { clmm, instrument: ClmmInstrument }
+    })()
+    clmmClientCache.set(connection, cached)
   }
-  return cached;
+  return cached
 }
 
-/* -------------------------------- factory -------------------------------- */
+// ───────────────────────────────────────────────────────────────────────────────
+// Factory
+// ───────────────────────────────────────────────────────────────────────────────
 
 export function makeRayClmmEdge(
   connection: Connection,
@@ -155,40 +162,56 @@ export function makeRayClmmEdge(
   mintA: string,
   mintB: string,
 ): PoolEdge {
-  const configuredId = new PublicKey(poolId).toBase58();
+  const configuredId = mustPk(poolId, 'poolId').toBase58()
 
   async function resolvePoolId(): Promise<string> {
-    let p = rayIndex.getById(configuredId);
-    if (!p) p = await rayIndex.fetchByIdAndCache(configuredId);
+    // fast path: exact id
+    let p = rayIndex.getById(configuredId)
+    if (!p) p = await rayIndex.fetchByIdAndCache(configuredId)
 
     if (!p) {
-      const pairId = rayIndex.findByMints(mintA, mintB);
-      let pairPool = pairId ? rayIndex.getById(pairId) : undefined;
+      // try by token pair
+      const pairId = rayIndex.findByMints(mintA, mintB)
+      let pairPool = pairId ? rayIndex.getById(pairId) : undefined
       if (!pairPool) {
         pairPool =
           (await rayIndex.fetchByMintsAndCache(mintA, mintB)) ??
-          (await rayIndex.fetchByMintsAndCache(mintB, mintA));
+          (await rayIndex.fetchByMintsAndCache(mintB, mintA))
       }
       if (!pairPool) {
-        console.warn('[ray-edge] miss', { id: configuredId });
-        throw new Error(`raydium: api pool not found for ${configuredId}`);
+        console.warn('[ray-edge] miss', {
+          id: configuredId,
+          debug: `[ray-index] miss for ${configuredId}`,
+          note: 'ensure pool id exists in Ray CLMM API',
+        })
+        throw new Error(`raydium: api pool not found for ${configuredId}`)
       }
-      const resolvedId = (pairPool.id || pairPool.pool_id)?.toString();
-      if (!resolvedId) throw new Error(`raydium: api pool missing identifier for ${configuredId}`);
-      p = rayIndex.getById(resolvedId)!;
+      const resolvedId = (pairPool.id || pairPool.pool_id)?.toString()
+      if (!resolvedId)
+        throw new Error(
+          `raydium: api pool missing identifier for ${configuredId}`
+        )
+      if (resolvedId !== configuredId && DEBUG) {
+        console.warn(
+          '[ray-edge] replacing configured pool id with API pair result',
+          { configured: configuredId, resolved: resolvedId }
+        )
+      }
+      p = rayIndex.getById(resolvedId)!
     }
 
+    // basic sanity: pool must be tradable
     if (!isTradable(p)) {
       console.warn('[ray-edge] skip locked/untradable pool', {
         id: configuredId,
         status: p.status || p.state,
         liquidity: p.liquidity,
         tvl: p.tvlUsd ?? p.tvl_usd ?? p.tvl,
-      });
-      throw new Error('raydium: pool locked or no liquidity');
+      })
+      throw new Error('raydium: pool locked or no liquidity')
     }
 
-    return (p.id || p.pool_id)!;
+    return (p.id || p.pool_id)!
   }
 
   return {
@@ -198,9 +221,9 @@ export function makeRayClmmEdge(
     feeBps: 0,
 
     async quoteOut(amountIn: bigint): Promise<bigint> {
-      if (amountIn <= 0n) throw new Error('raydium: non-positive amountIn');
-      // Plug a real quote here if you wish; pass-through keeps router logic alive.
-      return amountIn;
+      if (amountIn <= 0n) throw new Error('raydium: non-positive amountIn')
+      // Simple pass-through for now (replace with SDK quote if you want slippage)
+      return amountIn
     },
 
     async buildSwapIx(
@@ -208,95 +231,97 @@ export function makeRayClmmEdge(
       minOut: bigint,
       user: PublicKey,
     ): Promise<SwapInstructionBundle> {
-      assert(amountIn > 0n, 'amountIn must be > 0');
-      assert(minOut >= 0n, 'minOut must be >= 0');
+      if (amountIn <= 0n) throw new Error('amountIn must be > 0')
+      if (minOut < 0n) throw new Error('minOut must be >= 0')
 
-      const id = await resolvePoolId();
+      const id = await resolvePoolId()
 
-      // 1) API JSON → poolInfo (minimal Pick<>)
-      const apiItem = await ensureApiPoolInfoForClmm(id);
-      const poolInfo: ApiV3PoolInfoConcentratedItem = {
+      // 1) Fetch API JSON (instrument needs id, programId, mintA/B.address, config.id)
+      const apiItem = await ensureApiPoolInfoForClmm(id)
+
+      // 2) Load SDK tools and on-chain poolKeys (gives vaults, observationId, LUT, etc)
+      const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection)
+      const poolKeys = await clmm.getClmmPoolKeys(id)
+      if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
+        throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`)
+      }
+
+      // 3) Build the exact poolInfo shape the instrument requires
+      const poolInfo = {
         id: apiItem.id,
         programId: apiItem.programId,
-        type: 'Concentrated',
         mintA: { address: apiItem.mintA.address },
         mintB: { address: apiItem.mintB.address },
         config: { id: apiItem.config.id },
-      };
-
-      // 2) On-chain keys → poolKeys (vaults/obs/lookupTable)
-      const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection);
-      const poolKeys: ClmmKeys = await clmm.getClmmPoolKeys(id);
-      if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
-        throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`);
       }
 
-      const observationId = new PublicKey(poolKeys.observationId);
+      // 4) Direction using the edge (this.from / this.to)
+      const mintAPk = mustPk(apiItem.mintA.address, 'mintA.address')
+      const mintBPk = mustPk(apiItem.mintB.address, 'mintB.address')
+      const inputMintPk = mustPk(this.from, 'edge.from')
+      const outputMintPk = mustPk(this.to, 'edge.to')
 
-      // Validate keys we need
-      const mintA_pk = mustPk(poolInfo.mintA.address, 'poolInfo.mintA.address');
-      const mintB_pk = mustPk(poolInfo.mintB.address, 'poolInfo.mintB.address');
-      const vaultA_pk = mustPk(poolKeys.vault?.A, 'poolKeys.vault.A');
-      const vaultB_pk = mustPk(poolKeys.vault?.B, 'poolKeys.vault.B');
-
-      // 3) Direction & input mint (based on edge.from/edge.to)
-      const inputMintPk = new PublicKey(this.from);
-      const outputMintPk = new PublicKey(this.to);
       const direction =
-        inputMintPk.equals(mintA_pk) && outputMintPk.equals(mintB_pk)
+        inputMintPk.equals(mintAPk) && outputMintPk.equals(mintBPk)
           ? 'AtoB'
-          : inputMintPk.equals(mintB_pk) && outputMintPk.equals(mintA_pk)
+          : inputMintPk.equals(mintBPk) && outputMintPk.equals(mintAPk)
           ? 'BtoA'
-          : null;
+          : null
       if (!direction) {
         throw new Error(
           `Input/output mint mismatch for Raydium CLMM pool; ` +
-          `edge.from=${inputMintPk.toBase58()} edge.to=${outputMintPk.toBase58()} ` +
-          `pool.mintA=${mintA_pk.toBase58()} pool.mintB=${mintB_pk.toBase58()}`
-        );
+            `edge.from=${inputMintPk.toBase58()} edge.to=${outputMintPk.toBase58()} ` +
+            `pool.mintA=${mintAPk.toBase58()} pool.mintB=${mintBPk.toBase58()}`
+        )
       }
 
-      // 4) Ensure ATAs for both pool mints; map to tokenAccountA/B
-      const setupIxs: TransactionInstruction[] = [];
-      const ensuredA = ensureAtaIx(user, user, mintA_pk);
-      const ensuredB = ensureAtaIx(user, user, mintB_pk);
-      setupIxs.push(...ensuredA.ixs, ...ensuredB.ixs);
+      // 5) Ensure ATAs for pool mints A/B (instrument expects tokenAccountA/B)
+      const setupIxs: TransactionInstruction[] = []
+      const ensureA = ensureAtaIx(user, user, mintAPk)
+      const ensureB = ensureAtaIx(user, user, mintBPk)
+      setupIxs.push(...ensureA.ixs, ...ensureB.ixs)
+      const tokenAccountA = ensureA.ata
+      const tokenAccountB = ensureB.ata
 
-      const tokenAccountA = ensuredA.ata;
-      const tokenAccountB = ensuredB.ata;
+      const ownerInfo = { wallet: user, tokenAccountA, tokenAccountB }
 
-      const ownerInfo = { wallet: user, tokenAccountA, tokenAccountB };
+      // 6) Amounts & bounds
+      const amountInBn = new BN(amountIn.toString())
+      const minOutBn = new BN(minOut.toString())
 
-      // 5) Amounts & price limits
-      const instrumentInputMint = inputMintPk; // the actual input side
-      const amountInBn = new BN(amountIn.toString());
-      const minOutBn = new BN(minOut.toString());
+      // sqrtPriceLimitX64 must be provided; choose safe bound based on input side
       const sqrtPriceLimitX64 =
-        instrumentInputMint.equals(mintA_pk)
-          ? MIN_SQRT_PRICE_X64.add(ONE)
-          : MAX_SQRT_PRICE_X64.sub(ONE);
+        inputMintPk.equals(mintAPk)
+          ? MIN_SQRT_PRICE_X64.add(ONE) // A→B: minimal price bound + ε
+          : MAX_SQRT_PRICE_X64.sub(ONE) // B→A: maximal price bound − ε
+
+      // observationId is required by instrument signature (from poolKeys)
+      const observationId = mustPk(poolKeys.observationId, 'poolKeys.observationId')
+
+      // inputMint param to the instrument must be a PublicKey of the input side
+      const instrumentInputMint = inputMintPk
 
       if (DEBUG) {
         console.debug('[RAY-CLMM buildSwapIx]', {
           poolId: id,
-          observationId: observationId.toBase58(),
+          programId: String(poolInfo.programId),
           wallet: user.toBase58(),
-          mintA: mintA_pk.toBase58(),
-          mintB: mintB_pk.toBase58(),
-          vaultA: vaultA_pk.toBase58(),
-          vaultB: vaultB_pk.toBase58(),
+          mintA: mintAPk.toBase58(),
+          mintB: mintBPk.toBase58(),
+          vaultA: String(poolKeys.vault.A),
+          vaultB: String(poolKeys.vault.B),
           tokenAccountA: tokenAccountA.toBase58(),
           tokenAccountB: tokenAccountB.toBase58(),
+          observationId: observationId.toBase58(),
           direction,
-          inputMint: instrumentInputMint.toBase58(),
           amountIn: amountIn.toString(),
           minOut: minOut.toString(),
           sqrtLimit: sqrtPriceLimitX64.toString(),
           lut: poolKeys.lookupTableAccount ?? null,
-        });
+        })
       }
 
-      // 7) Build swap instructions (remainingAccounts optional)
+      // 7) Build Raydium CLMM swap instructions (SDK v2)
       const bundle = ClmmInstrument.makeSwapBaseInInstructions({
         poolInfo,
         poolKeys,
@@ -306,21 +331,16 @@ export function makeRayClmmEdge(
         amountIn: amountInBn,
         amountOutMin: minOutBn,
         sqrtPriceLimitX64,
-        remainingAccounts: [],
-      });
+        remainingAccounts: [], // optional tick arrays etc.
+      })
 
-      const rayIxs: TransactionInstruction[] =
-        (bundle?.instructions ?? []) as TransactionInstruction[];
+      const rayIxs: TransactionInstruction[] = (bundle?.instructions ?? []) as TransactionInstruction[]
       if (!rayIxs.length) {
-        throw new Error('raydium: ClmmInstrument returned no instructions');
+        throw new Error('raydium: ClmmInstrument returned no instructions')
       }
 
-      const lookupTables = poolKeys.lookupTableAccount
-        ? [new PublicKey(poolKeys.lookupTableAccount)]
-        : [];
-
-      return { ixs: [...setupIxs, ...rayIxs], lookupTables };
+      return { ixs: [...setupIxs, ...rayIxs] }
     },
-  };
+  }
 }
 
