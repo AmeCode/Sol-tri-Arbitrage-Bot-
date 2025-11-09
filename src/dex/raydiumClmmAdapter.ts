@@ -10,7 +10,7 @@ import {
 
 import { rayIndex } from '../initRay.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
-import { isTradable, normMintA, normMintB } from '../ray/clmmIndex.js';
+import { isTradable } from '../ray/clmmIndex.js';
 import { ensureAtaIx } from '../tokenAta.js';
 
 // We import these types only to annotate shapes clearly
@@ -51,21 +51,6 @@ function mustPk(v: string | PublicKey | undefined, label: string): PublicKey {
   } catch {
     throw new Error(`raydium: ${label} invalid: ${String(v)}`);
   }
-}
-
-function normalizeLookupTables(input: unknown): PublicKey[] {
-  if (!input) return [];
-  const arr = Array.isArray(input) ? input : [input];
-  const out: PublicKey[] = [];
-  for (const value of arr) {
-    if (!value) continue;
-    try {
-      out.push(value instanceof PublicKey ? value : new PublicKey(value));
-    } catch {
-      /* ignore invalid entries */
-    }
-  }
-  return out;
 }
 
 async function fetchApiPoolById(id: string): Promise<any | null> {
@@ -142,29 +127,24 @@ async function ensureApiPoolInfoForClmm(resolvedId: string): Promise<ApiV3PoolIn
   return normalized;
 }
 
-type ClmmTools = { ClmmInstrument: any; Clmm: any; Api: any; Raydium: any };
+type ClmmTools = { clmm: any; instrument: any };
+
 const sdkModulePromise = import('@raydium-io/raydium-sdk-v2');
 const clmmClientCache = new WeakMap<Connection, Promise<ClmmTools>>();
+
 async function loadClmmTools(connection: Connection): Promise<ClmmTools> {
   let cached = clmmClientCache.get(connection);
   if (!cached) {
     cached = (async () => {
-      const mod = await sdkModulePromise;
-      return {
-        ClmmInstrument: mod.ClmmInstrument,
-        Clmm: mod.Clmm,
-        Api: mod.Api,
-        Raydium: mod.Raydium,
-      };
+      const { Raydium, Clmm, Api, ClmmInstrument } = await sdkModulePromise;
+      const api = new Api({ cluster: 'mainnet' });
+      const raydium = new Raydium({ connection, api });
+      const clmm = new Clmm({ scope: raydium, moduleName: 'Clmm' });
+      return { clmm, instrument: ClmmInstrument };
     })();
     clmmClientCache.set(connection, cached);
   }
   return cached;
-}
-
-async function getAtaBalanceLamports(conn: Connection, ata: PublicKey): Promise<bigint> {
-  const info = await conn.getTokenAccountBalance(ata).catch(() => null);
-  return info?.value?.amount ? BigInt(info.value.amount) : 0n;
 }
 
 /* -------------------------------- factory -------------------------------- */
@@ -234,18 +214,26 @@ export function makeRayClmmEdge(
       const id = await resolvePoolId();
 
       // 1) API JSON → poolInfo (minimal Pick<>)
-      const apiInfo = await ensureApiPoolInfoForClmm(id);
-      const poolInfo: ApiV3PoolInfoConcentratedItem = apiInfo;
+      const apiItem = await ensureApiPoolInfoForClmm(id);
+      const poolInfo: ApiV3PoolInfoConcentratedItem = {
+        id: apiItem.id,
+        programId: apiItem.programId,
+        type: 'Concentrated',
+        mintA: { address: apiItem.mintA.address },
+        mintB: { address: apiItem.mintB.address },
+        config: { id: apiItem.config.id },
+      };
 
       // 2) On-chain keys → poolKeys (vaults/obs/lookupTable)
-      const { Clmm, Api, Raydium, ClmmInstrument } = await loadClmmTools(connection);
-      const api = new Api({ cluster: 'mainnet' });
-      const raydium = new Raydium({ connection, api });
-      const clmm = new Clmm({ scope: raydium, moduleName: 'Clmm' });
+      const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection);
       const poolKeys: ClmmKeys = await clmm.getClmmPoolKeys(id);
+      if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
+        throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`);
+      }
+
+      const observationId = new PublicKey(poolKeys.observationId);
 
       // Validate keys we need
-      const obsPk = mustPk(poolKeys.observationId, 'observationId');
       const mintA_pk = mustPk(poolInfo.mintA.address, 'poolInfo.mintA.address');
       const mintB_pk = mustPk(poolInfo.mintB.address, 'poolInfo.mintB.address');
       const vaultA_pk = mustPk(poolKeys.vault?.A, 'poolKeys.vault.A');
@@ -279,24 +267,8 @@ export function makeRayClmmEdge(
 
       const ownerInfo = { wallet: user, tokenAccountA, tokenAccountB };
 
-      // 5) Preflight balance on the source ATA (prevents SPL 0x1)
+      // 5) Amounts & price limits
       const instrumentInputMint = inputMintPk; // the actual input side
-      const srcAta = instrumentInputMint.equals(mintA_pk) ? tokenAccountA : tokenAccountB;
-      const bal = await getAtaBalanceLamports(connection, srcAta);
-      if (bal < amountIn) {
-        if (DEBUG) {
-          console.warn('[RayCLMM] insufficient source balance, skipping hop', {
-            poolId: id,
-            inputMint: instrumentInputMint.toBase58(),
-            srcAta: srcAta.toBase58(),
-            have: bal.toString(),
-            need: amountIn.toString(),
-          });
-        }
-        throw new Error('raydium: insufficient source balance for hop');
-      }
-
-      // 6) Amounts & price limits
       const amountInBn = new BN(amountIn.toString());
       const minOutBn = new BN(minOut.toString());
       const sqrtPriceLimitX64 =
@@ -307,7 +279,7 @@ export function makeRayClmmEdge(
       if (DEBUG) {
         console.debug('[RAY-CLMM buildSwapIx]', {
           poolId: id,
-          observationId: obsPk.toBase58(),
+          observationId: observationId.toBase58(),
           wallet: user.toBase58(),
           mintA: mintA_pk.toBase58(),
           mintB: mintB_pk.toBase58(),
@@ -328,7 +300,7 @@ export function makeRayClmmEdge(
       const bundle = ClmmInstrument.makeSwapBaseInInstructions({
         poolInfo,
         poolKeys,
-        observationId: obsPk,
+        observationId,
         ownerInfo,
         inputMint: instrumentInputMint,
         amountIn: amountInBn,
@@ -343,12 +315,9 @@ export function makeRayClmmEdge(
         throw new Error('raydium: ClmmInstrument returned no instructions');
       }
 
-      // NOTE on LUTs: the instrument *exposes* `lookupTableAddress` inside its return.
-      // Your outer transaction builder must fetch and add those LUT accounts to the v0 message.
-      // If not, you will see "address table lookup uses an invalid index".
-      // (Your framework already logs and includes dex tables; keep doing that.)
-
-      const lookupTables = normalizeLookupTables((bundle as any)?.lookupTableAddress);
+      const lookupTables = poolKeys.lookupTableAccount
+        ? [new PublicKey(poolKeys.lookupTableAccount)]
+        : [];
 
       return { ixs: [...setupIxs, ...rayIxs], lookupTables };
     },
