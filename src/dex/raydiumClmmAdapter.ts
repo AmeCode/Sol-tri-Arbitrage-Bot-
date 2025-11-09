@@ -12,6 +12,9 @@ import { rayIndex } from '../initRay.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { isTradable } from '../ray/clmmIndex.js';
 import { ensureAtaIx } from '../tokenAta.js';
+import { RUNTIME } from '../runtime.js';
+import { mustAccount } from '../onchain/assertions.js';
+import { AccountLayout } from '@solana/spl-token';
 
 // We import these types only to annotate shapes clearly
 // (no runtime import)
@@ -260,10 +263,36 @@ export function makeRayClmmEdge(
       const setupIxs: TransactionInstruction[] = [];
       const ensuredA = ensureAtaIx(user, user, mintA_pk);
       const ensuredB = ensureAtaIx(user, user, mintB_pk);
-      setupIxs.push(...ensuredA.ixs, ...ensuredB.ixs);
+      let mintAInfo: Awaited<ReturnType<typeof mustAccount>> | null = null;
+      let mintBInfo: Awaited<ReturnType<typeof mustAccount>> | null = null;
+
+      if (RUNTIME.mode === 'live') {
+        if (ensuredA.ixs.length) setupIxs.push(...ensuredA.ixs);
+        if (ensuredB.ixs.length) setupIxs.push(...ensuredB.ixs);
+      } else if (RUNTIME.requirePrealloc) {
+        mintAInfo = await mustAccount(connection, ensuredA.ata, 'simulate: raydium mintA ATA');
+        mintBInfo = await mustAccount(connection, ensuredB.ata, 'simulate: raydium mintB ATA');
+      }
 
       const tokenAccountA = ensuredA.ata;
       const tokenAccountB = ensuredB.ata;
+
+      if (RUNTIME.mode === 'simulate' && RUNTIME.requirePrealloc) {
+        const inputAta = direction === 'AtoB' ? tokenAccountA : tokenAccountB;
+        const outputAta = direction === 'AtoB' ? tokenAccountB : tokenAccountA;
+        const inputInfo =
+          direction === 'AtoB'
+            ? mintAInfo ?? (await mustAccount(connection, inputAta, 'simulate: raydium input ATA'))
+            : mintBInfo ?? (await mustAccount(connection, inputAta, 'simulate: raydium input ATA'));
+        const decoded = AccountLayout.decode(inputInfo.data);
+        const available = BigInt(decoded.amount.toString());
+        if (available < amountIn) {
+          throw new Error(
+            `simulate: raydium input ATA ${inputAta.toBase58()} has ${available}, needs ${amountIn}`,
+          );
+        }
+        await mustAccount(connection, outputAta, 'simulate: raydium output ATA');
+      }
 
       const ownerInfo = { wallet: user, tokenAccountA, tokenAccountB };
 

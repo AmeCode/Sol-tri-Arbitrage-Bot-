@@ -13,6 +13,8 @@ import {
   getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
 
+import { RUNTIME } from './runtime.js';
+
 /**
  * Ensure owner's ATA for a mint. Returns the ATA pubkey + optional create ix.
  */
@@ -28,15 +30,24 @@ export function ensureAtaIx(
     TOKEN_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
-  const createIx = createAssociatedTokenAccountIdempotentInstruction(
-    payer,
-    ata,
-    owner,
-    mint,
-    TOKEN_PROGRAM_ID,
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-  );
-  return { ata, ixs: [createIx] };
+
+  const ixs: TransactionInstruction[] = [];
+  const shouldAllocate =
+    RUNTIME.mode === 'live' && RUNTIME.requirePrealloc === false;
+  if (shouldAllocate) {
+    ixs.push(
+      createAssociatedTokenAccountIdempotentInstruction(
+        payer,
+        ata,
+        owner,
+        mint,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+      ),
+    );
+  }
+
+  return { ata, ixs };
 }
 
 /**
@@ -48,16 +59,28 @@ export function wrapSolIntoAta(
   owner: PublicKey,
   amountLamports: bigint,
 ): { ata: PublicKey; ixs: TransactionInstruction[] } {
-  const { ata, ixs } = ensureAtaIx(payer, owner, NATIVE_MINT);
+  if (RUNTIME.mode === 'simulate') {
+    throw new Error(
+      'simulate: wrapSolIntoAta disabled; pre-create & pre-fund WSOL ATA',
+    );
+  }
+
+  const ensured = ensureAtaIx(payer, owner, NATIVE_MINT);
+  if (RUNTIME.wsolPrewrap) {
+    // Pre-wrapped WSOL should already be funded via prep script.
+    return { ata: ensured.ata, ixs: [] };
+  }
+
+  const ixs = [...ensured.ixs];
   ixs.push(
     SystemProgram.transfer({
       fromPubkey: payer,
-      toPubkey: ata,
+      toPubkey: ensured.ata,
       lamports: Number(amountLamports),
     }),
   );
-  ixs.push(createSyncNativeInstruction(ata, TOKEN_PROGRAM_ID));
-  return { ata, ixs };
+  ixs.push(createSyncNativeInstruction(ensured.ata, TOKEN_PROGRAM_ID));
+  return { ata: ensured.ata, ixs };
 }
 
 /**

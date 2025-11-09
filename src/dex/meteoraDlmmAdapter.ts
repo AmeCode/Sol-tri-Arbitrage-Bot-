@@ -5,11 +5,13 @@ import {
   Connection,
 } from '@solana/web3.js';
 import BN from 'bn.js';
-import { NATIVE_MINT } from '@solana/spl-token';
+import { NATIVE_MINT, AccountLayout } from '@solana/spl-token';
 import { createRequire } from 'module';
 
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
+import { RUNTIME } from '../runtime.js';
+import { mustAccount } from '../onchain/assertions.js';
 
 // ───────────────────────────────────────────────────────────────────────────────
 // Config / utils
@@ -195,19 +197,49 @@ export function makeMeteoraEdge(
       // Prep ATAs & wrap WSOL (input)
       const setupIxs: TransactionInstruction[] = [];
 
-      let sourceAta: PublicKey;
+      const ensuredSrc = ensureAtaIx(user, user, inMintPk);
+      let sourceAta: PublicKey = ensuredSrc.ata;
+
       if (inMintPk.equals(NATIVE_MINT)) {
-        const wrapped = wrapSolIntoAta(user, user, amountIn);
-        setupIxs.push(...wrapped.ixs);
-        sourceAta = wrapped.ata;
+        if (RUNTIME.mode === 'simulate') {
+          if (RUNTIME.requirePrealloc) {
+            const info = await mustAccount(connection, sourceAta, 'simulate: meteora WSOL ATA');
+            const available = BigInt(AccountLayout.decode(info.data).amount.toString());
+            if (available < amountIn) {
+              throw new Error(
+                `simulate: meteora WSOL ATA ${sourceAta.toBase58()} has ${available}, needs ${amountIn}`,
+              );
+            }
+          }
+        } else {
+          if (!RUNTIME.wsolPrewrap) {
+            const wrapped = wrapSolIntoAta(user, user, amountIn);
+            setupIxs.push(...wrapped.ixs);
+            sourceAta = wrapped.ata;
+          } else if (ensuredSrc.ixs.length) {
+            setupIxs.push(...ensuredSrc.ixs);
+          }
+        }
       } else {
-        const ensured = ensureAtaIx(user, user, inMintPk);
-        setupIxs.push(...ensured.ixs);
-        sourceAta = ensured.ata;
+        if (RUNTIME.mode === 'live') {
+          if (ensuredSrc.ixs.length) setupIxs.push(...ensuredSrc.ixs);
+        } else if (RUNTIME.requirePrealloc) {
+          const info = await mustAccount(connection, sourceAta, 'simulate: meteora source ATA');
+          const available = BigInt(AccountLayout.decode(info.data).amount.toString());
+          if (available < amountIn) {
+            throw new Error(
+              `simulate: meteora source ATA ${sourceAta.toBase58()} has ${available}, needs ${amountIn}`,
+            );
+          }
+        }
       }
 
       const ensuredDst = ensureAtaIx(user, user, outMintPk);
-      setupIxs.push(...ensuredDst.ixs);
+      if (RUNTIME.mode === 'live') {
+        if (ensuredDst.ixs.length) setupIxs.push(...ensuredDst.ixs);
+      } else if (RUNTIME.requirePrealloc) {
+        await mustAccount(connection, ensuredDst.ata, 'simulate: meteora destination ATA');
+      }
       const destinationAta = ensuredDst.ata;
 
       const bnIn = new BN(amountIn.toString());

@@ -1,62 +1,160 @@
+import {
+  ComputeBudgetProgram,
+  Connection,
+  Keypair,
+  PublicKey,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js';
+import bs58 from 'bs58';
+
 import { CFG } from './config.js';
+import { RUNTIME, withRuntimeMode } from './runtime.js';
 import { makeConnections } from './rpc.js';
 import { buildEdges } from './graph/builder.js';
 import { findTriCandidates } from './graph/findTri.js';
 import { bestSize } from './sizing.js';
-import { startMetrics, cBundlesOk, cBundlesSent, cSimFail, cExecFail, gIncludeRatio, gPriorityFee, cScansTotal } from './metrics.js';
-import { Keypair, PublicKey, Connection, TransactionInstruction } from '@solana/web3.js';
-import bs58 from 'bs58';
-import { ensureLutHas } from './lut.js';
-import { buildAndMaybeLut, getRuntimeLutAddress, setRuntimeLutAddress } from './tx.js';
-import { sendAndConfirmAny, simulateWithLogs } from './send.js';
+import {
+  startMetrics,
+  cBundlesOk,
+  cBundlesSent,
+  cSimFail,
+  cExecFail,
+  gIncludeRatio,
+  gPriorityFee,
+  cScansTotal,
+} from './metrics.js';
+import { loadLookupTableAccounts, loadStaticLuts } from './lut/lookupTables.js';
+import type { PoolEdge } from './graph/types.js';
 
-function allowedByHopCount(pathLen: number, lutExists: boolean) {
+function allowedByHopCount(pathLen: number) {
   if (pathLen <= CFG.maxHops) return true;
-  if (pathLen === 3 && CFG.allowThirdHop && lutExists) return true;
+  const hasStaticLut = RUNTIME.useLut && RUNTIME.lutAddresses.length > 0;
+  if (pathLen === 3 && CFG.allowThirdHop && hasStaticLut) return true;
   return false;
 }
 
-function isInvalidLookupTableError(err: unknown, logs?: string[] | null): boolean {
-  try {
-    const errString = typeof err === 'string' ? err : JSON.stringify(err);
-    if (errString && errString.toLowerCase().includes('invalid index')) return true;
-  } catch {
-    /* ignore */
-  }
-  if (Array.isArray(logs)) {
-    for (const line of logs) {
-      if (typeof line === 'string' && line.toLowerCase().includes('invalid index')) {
-        return true;
+type RouteBuild = {
+  instructions: TransactionInstruction[];
+  extraSigners: Keypair[];
+  lookupTables: PublicKey[];
+};
+
+async function buildRouteIxs(
+  mode: 'simulate' | 'live',
+  path: PoolEdge[],
+  hopQuotes: bigint[],
+  walletPk: PublicKey,
+  amountIn: bigint,
+): Promise<RouteBuild> {
+  return withRuntimeMode(mode, async () => {
+    const instructions: TransactionInstruction[] = [];
+    const extraSigners: Keypair[] = [];
+    const lookupTables: PublicKey[] = [];
+
+    let currentAmount = amountIn;
+    for (let i = 0; i < path.length; i++) {
+      const edge = path[i];
+      const minOut = hopQuotes[i];
+      const result = await edge.buildSwapIx(currentAmount, minOut, walletPk);
+      if (result.ixs?.length) instructions.push(...result.ixs);
+      if (result.extraSigners?.length) extraSigners.push(...result.extraSigners);
+      if (result.lookupTables?.length) {
+        for (const lut of result.lookupTables) {
+          if (!lookupTables.some((pk) => pk.equals(lut))) {
+            lookupTables.push(lut);
+          }
+        }
       }
+      currentAmount = minOut;
     }
-  }
-  return false;
+
+    return { instructions, extraSigners, lookupTables };
+  });
 }
 
-async function primeLutFromRegistry(connection: Connection, wallet: Keypair) {
-  const pools = [...CFG.pools.orca, ...CFG.pools.ray, ...CFG.pools.meteora];
-  const seen = new Set<string>();
-  const keys: PublicKey[] = [];
-  for (const pool of pools) {
-    try {
-      const pk = new PublicKey(pool.id);
-      const base58 = pk.toBase58();
-      if (!seen.has(base58)) {
-        seen.add(base58);
-        keys.push(pk);
-      }
-    } catch (e) {
-      console.warn('[lut] skip invalid pool id', pool.id, (e as Error)?.message ?? e);
-    }
+type TryRouteParams = {
+  mode: 'simulate' | 'live';
+  connection: Connection;
+  path: PoolEdge[];
+  hopQuotes: bigint[];
+  wallet: Keypair;
+  amountIn: bigint;
+  priorityFee: number;
+};
+
+type TryRouteResult =
+  | { kind: 'simulate'; sim: Awaited<ReturnType<Connection['simulateTransaction']>> }
+  | { kind: 'live'; signature: string };
+
+async function tryRoute({
+  mode,
+  connection,
+  path,
+  hopQuotes,
+  wallet,
+  amountIn,
+  priorityFee,
+}: TryRouteParams): Promise<TryRouteResult> {
+  const built = await buildRouteIxs(mode, path, hopQuotes, wallet.publicKey, amountIn);
+  if (built.instructions.length === 0) {
+    throw new Error('route produced no instructions');
   }
-  if (keys.length === 0) return;
-  try {
-    const ensured = await ensureLutHas(connection, wallet.publicKey, wallet, getRuntimeLutAddress(), keys);
-    setRuntimeLutAddress(ensured);
-    console.log('[lut] primed from registry', ensured.toBase58(), 'keys', keys.length);
-  } catch (e) {
-    console.error('[lut] prime failed', (e as Error)?.message ?? e);
+
+  const staticLuts = await loadStaticLuts(connection);
+  const seen = new Set(staticLuts.map((acc) => acc.key.toBase58()));
+  const dynamicAddresses = built.lookupTables.filter((pk) => {
+    const key = pk.toBase58();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  const dynamicLuts = await loadLookupTableAccounts(connection, dynamicAddresses);
+  const lutAccounts = [...staticLuts, ...dynamicLuts];
+
+  const withCompute: TransactionInstruction[] = [];
+  const cuLimit = CFG.cuLimit ?? 1_400_000;
+  if (cuLimit) {
+    withCompute.push(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
   }
+  if (priorityFee > 0) {
+    withCompute.push(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee }),
+    );
+  }
+
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(
+    'processed',
+  );
+  const message = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [...withCompute, ...built.instructions],
+  }).compileToV0Message(lutAccounts);
+
+  const tx = new VersionedTransaction(message);
+  const signers = [wallet, ...built.extraSigners];
+  tx.sign(signers);
+
+  if (mode === 'simulate') {
+    const sim = await connection.simulateTransaction(tx, {
+      replaceRecentBlockhash: true,
+      sigVerify: false,
+    });
+    return { kind: 'simulate', sim };
+  }
+
+  const signature = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    preflightCommitment: 'confirmed',
+  });
+  await connection.confirmTransaction(
+    { signature, blockhash, lastValidBlockHeight },
+    'confirmed',
+  );
+  console.log('[send] success', signature);
+  return { kind: 'live', signature };
 }
 
 async function main() {
@@ -72,20 +170,23 @@ async function main() {
   const { send: sendConn } = makeConnections();
   const wallet = Keypair.fromSecretKey(bs58.decode(CFG.walletSecret));
 
-  // Build edges and set up WS subs inside builder
   const edges = await buildEdges();
   console.log(`[init] edges=${edges.length}, tokens=${CFG.tokensUniverse.length}`);
 
-  await primeLutFromRegistry(sendConn, wallet);
-
   let priorityFee = CFG.priorityFeeMin;
-  let sent = 0, ok = 0, consecutiveFails = 0;
+  let sent = 0;
+  let ok = 0;
+  let consecutiveFails = 0;
 
   function tuneFee() {
     const ratio = sent ? ok / sent : 0;
     gIncludeRatio.set(ratio);
-    if (ratio < CFG.includeRatioTarget && priorityFee < CFG.priorityFeeMax) priorityFee += CFG.feeAdjStep;
-    if (ratio > CFG.includeRatioTarget && priorityFee > CFG.priorityFeeMin) priorityFee -= CFG.feeAdjStep;
+    if (ratio < CFG.includeRatioTarget && priorityFee < CFG.priorityFeeMax) {
+      priorityFee += CFG.feeAdjStep;
+    }
+    if (ratio > CFG.includeRatioTarget && priorityFee > CFG.priorityFeeMin) {
+      priorityFee -= CFG.feeAdjStep;
+    }
     if (priorityFee < CFG.priorityFeeMin) priorityFee = CFG.priorityFeeMin;
     if (priorityFee > CFG.priorityFeeMax) priorityFee = CFG.priorityFeeMax;
     gPriorityFee.set(priorityFee);
@@ -97,18 +198,21 @@ async function main() {
       cScansTotal.inc();
       console.log('[scan] start');
       console.log(`[scan] edges=${edges.length}`);
-      const seed = CFG.sizeLadder[0]; // seed for candidate scan
+      const seed = CFG.sizeLadder[0];
       console.log(`[scan] building candidates with seed=${seed}`);
       const candidates = await findTriCandidates(edges, seed);
-      const lutExists = getRuntimeLutAddress() !== null;
-      const filteredCandidates = candidates.filter(path => allowedByHopCount(path.length, lutExists));
-      console.log(`[scan] candidates=${candidates.length}, filtered=${filteredCandidates.length}`);
+      const filteredCandidates = candidates.filter((path) =>
+        allowedByHopCount(path.length),
+      );
+      console.log(
+        `[scan] candidates=${candidates.length}, filtered=${filteredCandidates.length}`,
+      );
 
       for (const path of filteredCandidates) {
         const sized = await bestSize(path, CFG.sizeLadder);
         if (!sized) continue;
 
-        const routeId = path.map(e => e.id).join(' -> ');
+        const routeId = path.map((e) => e.id).join(' -> ');
         console.log(`[scan] evaluating route ${routeId}`);
 
         const hopQuotes: bigint[] = [];
@@ -141,121 +245,90 @@ async function main() {
 
         if (finalOut <= sized.inAmount) continue;
 
-        console.log('[send] building tx...');
-        const swapIxs: TransactionInstruction[] = [];
-        const extraSigners: Keypair[] = [];
-        const dexLookupTables: PublicKey[] = [];
-        let amountIn = sized.inAmount;
-        for (let i = 0; i < path.length; i++) {
-          const edge = path[i];
-          const minOut = hopQuotes[i];
-          const result = await edge.buildSwapIx(amountIn, minOut, wallet.publicKey);
-          swapIxs.push(...result.ixs);
-          if (result.extraSigners?.length) {
-            extraSigners.push(...result.extraSigners);
-          }
-          if (result.lookupTables?.length) {
-            dexLookupTables.push(...result.lookupTables);
-          }
-          amountIn = minOut;
-        }
-
-        if (swapIxs.length === 0) {
-          console.warn('[route] no instructions built, skipping');
-          continue;
-        }
-
-        let skipPostProcessing = false;
         let skipTune = false;
-        try {
-          // 👉 Build (legacy first, then v0/LUT if needed)
-          let built = await buildAndMaybeLut(
-            sendConn,
-            wallet.publicKey,
-            wallet,
-            swapIxs,
-            /* cuPrice */ priorityFee,      // micro-lamports per CU
-            /* cuLimit  */ CFG.cuLimit ?? 1_400_000,
-            /* extraSignerPubkeys */ extraSigners.map(k => k.publicKey),
-            /* dexLookupTables */ dexLookupTables,
-            /* includeRuntimeLut */ true,
-          );
 
-          console.log('[route] instructions count =', swapIxs.length);
-          if ('lutAddressUsed' in built && built.lutAddressUsed) {
-            console.log('[lut] used', built.lutAddressUsed.toBase58());
-          }
-          if (dexLookupTables.length) {
-            console.log('[lut] dex tables', dexLookupTables.map(l => l.toBase58()));
-          }
+        const simResult = await tryRoute({
+          mode: 'simulate',
+          connection: sendConn,
+          path,
+          hopQuotes,
+          wallet,
+          amountIn: sized.inAmount,
+          priorityFee,
+        });
 
-          // 👉 Simulate (always signed; gets logs)
-          let sim = await simulateWithLogs(sendConn, built, [wallet, ...extraSigners]);
-          if (
-            sim.value.err &&
-            built.kind === 'v0' &&
-            dexLookupTables.length > 0 &&
-            isInvalidLookupTableError(sim.value.err, sim.value.logs)
-          ) {
-            console.warn('[sim] invalid LUT index detected → rebuilding without runtime LUT');
-            built = await buildAndMaybeLut(
-              sendConn,
-              wallet.publicKey,
-              wallet,
-              swapIxs,
-              /* cuPrice */ priorityFee,
-              /* cuLimit  */ CFG.cuLimit ?? 1_400_000,
-              /* extraSignerPubkeys */ extraSigners.map(k => k.publicKey),
-              /* dexLookupTables */ dexLookupTables,
-              /* includeRuntimeLut */ false,
-            );
-            sim = await simulateWithLogs(sendConn, built, [wallet, ...extraSigners]);
-          }
-
-          if (sim.value.err) {
-            console.warn('[sim] failed:', sim.value.err);
-            sim.value.logs?.forEach((l, i) => console.warn(String(i).padStart(2, '0'), l));
-            cSimFail.inc();
-            consecutiveFails++;
-            skipPostProcessing = true;
-            if (CFG.haltOnNegativeSim) {
-              skipTune = true;
-            }
-          } else {
-            // 👉 Send
-            const sig = await sendAndConfirmAny(sendConn, built, [wallet, ...extraSigners]);
-            console.log('[send] success', sig);
-            cBundlesSent.inc(); sent++;
-            cBundlesOk.inc(); ok++; consecutiveFails = 0;
-          }
-        } catch (e: any) {
-          cBundlesSent.inc(); sent++;
-          cExecFail.inc(); consecutiveFails++;
-          console.error('[send] error', e?.message ?? e);
-          skipPostProcessing = true;
-        }
-
-        if (!skipTune) {
-          tuneFee();
-          if (consecutiveFails >= CFG.maxConsecutiveFails) {
-            console.error(`[risk] ${consecutiveFails} consecutive fails → cooldown`);
-            await new Promise(r => setTimeout(r, 5000));
-            consecutiveFails = 0;
-          }
-        }
-
-        if (skipPostProcessing) {
+        if (simResult.kind !== 'simulate') {
+          console.warn('[sim] unexpected result kind');
           continue;
+        }
+
+        if (simResult.sim.value.err) {
+          console.warn('[sim] failed:', simResult.sim.value.err);
+          simResult.sim.value.logs?.forEach((l, i) =>
+            console.warn(String(i).padStart(2, '0'), l),
+          );
+          cSimFail.inc();
+          consecutiveFails++;
+          if (CFG.haltOnNegativeSim) skipTune = true;
+          if (!skipTune) {
+            tuneFee();
+            if (consecutiveFails >= CFG.maxConsecutiveFails) {
+              console.error(`[risk] ${consecutiveFails} consecutive fails → cooldown`);
+              await new Promise((r) => setTimeout(r, 5000));
+              consecutiveFails = 0;
+            }
+          }
+          continue;
+        }
+
+        if (RUNTIME.configuredMode === 'simulate') {
+          console.log('[sim] MODE=simulate → not sending live tx');
+          tuneFee();
+          continue;
+        }
+
+        try {
+          const sendResult = await tryRoute({
+            mode: 'live',
+            connection: sendConn,
+            path,
+            hopQuotes,
+            wallet,
+            amountIn: sized.inAmount,
+            priorityFee,
+          });
+
+          if (sendResult.kind !== 'live') {
+            throw new Error('expected live result');
+          }
+
+          cBundlesSent.inc();
+          sent++;
+          cBundlesOk.inc();
+          ok++;
+          consecutiveFails = 0;
+        } catch (e: any) {
+          cBundlesSent.inc();
+          sent++;
+          cExecFail.inc();
+          consecutiveFails++;
+          console.error('[send] error', e?.message ?? e);
+        }
+
+        tuneFee();
+        if (consecutiveFails >= CFG.maxConsecutiveFails) {
+          console.error(`[risk] ${consecutiveFails} consecutive fails → cooldown`);
+          await new Promise((r) => setTimeout(r, 5000));
+          consecutiveFails = 0;
         }
       }
 
-      await new Promise(r => setTimeout(r, CFG.cooldownMs));
+      await new Promise((r) => setTimeout(r, CFG.cooldownMs));
     } catch (e) {
       console.error('[loop]', e);
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 1000));
     }
   }
 }
 
 main().catch(console.error);
-

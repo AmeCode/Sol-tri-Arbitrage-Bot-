@@ -12,8 +12,10 @@ import { Percentage } from '@orca-so/common-sdk';
 import BN from 'bn.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
 import { CFG } from '../config.js';
-import { NATIVE_MINT } from '@solana/spl-token';
+import { NATIVE_MINT, AccountLayout } from '@solana/spl-token';
 import { ensureAtaIx, wrapSolIntoAta } from '../tokenAta.js';
+import { RUNTIME } from '../runtime.js';
+import { mustAccount } from '../onchain/assertions.js';
 
 export function makeOrcaEdge(
   whirlpool: string,
@@ -76,20 +78,51 @@ export function makeOrcaEdge(
       );
 
       const instructions: TransactionInstruction[] = [];
+      const connection = ctx.connection;
 
-      let sourceAta: PublicKey;
+      const ensuredSrc = ensureAtaIx(user, user, inputMint);
+      let sourceAta: PublicKey = ensuredSrc.ata;
+
       if (inputMint.equals(NATIVE_MINT)) {
-        const wrapped = wrapSolIntoAta(user, user, amountIn);
-        instructions.push(...wrapped.ixs);
-        sourceAta = wrapped.ata;
+        if (RUNTIME.mode === 'simulate') {
+          if (RUNTIME.requirePrealloc) {
+            const info = await mustAccount(connection, sourceAta, 'simulate: orca WSOL ATA');
+            const available = BigInt(AccountLayout.decode(info.data).amount.toString());
+            if (available < amountIn) {
+              throw new Error(
+                `simulate: orca WSOL ATA ${sourceAta.toBase58()} has ${available}, needs ${amountIn}`,
+              );
+            }
+          }
+        } else {
+          if (!RUNTIME.wsolPrewrap) {
+            const wrapped = wrapSolIntoAta(user, user, amountIn);
+            instructions.push(...wrapped.ixs);
+            sourceAta = wrapped.ata;
+          } else if (ensuredSrc.ixs.length) {
+            instructions.push(...ensuredSrc.ixs);
+          }
+        }
       } else {
-        const ensured = ensureAtaIx(user, user, inputMint);
-        instructions.push(...ensured.ixs);
-        sourceAta = ensured.ata;
+        if (RUNTIME.mode === 'live') {
+          if (ensuredSrc.ixs.length) instructions.push(...ensuredSrc.ixs);
+        } else if (RUNTIME.requirePrealloc) {
+          const info = await mustAccount(connection, sourceAta, 'simulate: orca source ATA');
+          const available = BigInt(AccountLayout.decode(info.data).amount.toString());
+          if (available < amountIn) {
+            throw new Error(
+              `simulate: orca source ATA ${sourceAta.toBase58()} has ${available}, needs ${amountIn}`,
+            );
+          }
+        }
       }
 
       const ensuredDst = ensureAtaIx(user, user, outputMint);
-      instructions.push(...ensuredDst.ixs);
+      if (RUNTIME.mode === 'live') {
+        if (ensuredDst.ixs.length) instructions.push(...ensuredDst.ixs);
+      } else if (RUNTIME.requirePrealloc) {
+        await mustAccount(connection, ensuredDst.ata, 'simulate: orca destination ATA');
+      }
       const destinationAta = ensuredDst.ata;
 
       const params = SwapUtils.getSwapParamsFromQuote(
