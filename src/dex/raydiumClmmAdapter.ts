@@ -2,7 +2,15 @@
 import { strict as assert } from 'assert';
 import { Connection, PublicKey, TransactionInstruction } from '@solana/web3.js';
 import BN from 'bn.js';
-import { MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64, ONE } from '@raydium-io/raydium-sdk-v2';
+import {
+  jsonInfo2PoolKeys,
+  MIN_SQRT_PRICE_X64,
+  MAX_SQRT_PRICE_X64,
+  ONE,
+  getPdaObservationAccount,
+  getPdaPoolVaultId,
+  getPdaPoolAuthority,
+} from '@raydium-io/raydium-sdk-v2';
 
 import { rayIndex } from '../initRay.js';
 import type { PoolEdge, SwapInstructionBundle } from '../graph/types.js';
@@ -95,24 +103,73 @@ async function ensureApiPoolInfoForClmm(resolvedId: string): Promise<ApiV3PoolIn
     apiItem = fetched;
   }
 
-  const normalized: ApiV3PoolInfoConcentratedItem = {
-    id: String(apiItem.id ?? apiItem.pool_id),
-    programId: String(apiItem.programId ?? apiItem.program_id),
+  const normalizedPoolId = String(apiItem.id ?? apiItem.pool_id);
+  const resolvedProgramId = String(apiItem.programId ?? apiItem.program_id);
+  const resolvedMintA =
+    typeof apiItem.mintA === 'object'
+      ? String(apiItem.mintA.address)
+      : String(apiItem.mintA);
+  const resolvedMintB =
+    typeof apiItem.mintB === 'object'
+      ? String(apiItem.mintB.address)
+      : String(apiItem.mintB);
+  const resolvedConfigId =
+    typeof apiItem.config === 'object' && apiItem.config?.id
+      ? String(apiItem.config.id)
+      : apiItem.config_id
+      ? String(apiItem.config_id)
+      : String(apiItem.config);
+
+  const programIdPk = new PublicKey(resolvedProgramId);
+  const poolIdPk = new PublicKey(normalizedPoolId);
+  const mintAPk = new PublicKey(resolvedMintA);
+  const mintBPk = new PublicKey(resolvedMintB);
+
+  const observationId =
+    apiItem.observationId ??
+    apiItem.observation_id ??
+    getPdaObservationAccount(programIdPk, poolIdPk).publicKey.toBase58();
+
+  const vaultA =
+    apiItem.vaultA ??
+    apiItem.vault_a ??
+    apiItem.vault?.A ??
+    getPdaPoolVaultId(programIdPk, poolIdPk, mintAPk).publicKey.toBase58();
+  const vaultB =
+    apiItem.vaultB ??
+    apiItem.vault_b ??
+    apiItem.vault?.B ??
+    getPdaPoolVaultId(programIdPk, poolIdPk, mintBPk).publicKey.toBase58();
+
+  const authority =
+    apiItem.authority ??
+    apiItem.poolAuthority ??
+    apiItem.pool_authority ??
+    getPdaPoolAuthority(programIdPk, poolIdPk).publicKey.toBase58();
+
+  const lookupTableAccount =
+    apiItem.lookupTableAccount ??
+    apiItem.lookup_table_account ??
+    apiItem.lookupTableAddress ??
+    apiItem.lookup_table_address ??
+    undefined;
+
+  const normalized: ApiV3PoolInfoConcentratedItem & {
+    observationId?: string;
+    vault?: { A: string; B: string };
+    authority?: string;
+    lookupTableAccount?: string;
+  } = {
+    id: normalizedPoolId,
+    programId: resolvedProgramId,
     type: 'Concentrated',
-    mintA:
-      typeof apiItem.mintA === 'object'
-        ? { address: apiItem.mintA.address }
-        : { address: String(apiItem.mintA) },
-    mintB:
-      typeof apiItem.mintB === 'object'
-        ? { address: apiItem.mintB.address }
-        : { address: String(apiItem.mintB) },
-    config:
-      typeof apiItem.config === 'object' && apiItem.config?.id
-        ? { id: String(apiItem.config.id) }
-        : apiItem.config_id
-        ? { id: String(apiItem.config_id) }
-        : { id: String(apiItem.config) },
+    mintA: { address: resolvedMintA },
+    mintB: { address: resolvedMintB },
+    config: { id: resolvedConfigId },
+    observationId: String(observationId),
+    vault: { A: String(vaultA), B: String(vaultB) },
+    authority: String(authority),
+    lookupTableAccount: lookupTableAccount ? String(lookupTableAccount) : undefined,
   };
 
   if (!normalized.id || !normalized.programId || !normalized.mintA?.address || !normalized.mintB?.address) {
@@ -123,22 +180,18 @@ async function ensureApiPoolInfoForClmm(resolvedId: string): Promise<ApiV3PoolIn
   return normalized;
 }
 
-type ClmmTools = { clmm: any; instrument: any };
-
 const sdkModulePromise = import('@raydium-io/raydium-sdk-v2');
-const clmmClientCache = new WeakMap<Connection, Promise<ClmmTools>>();
+type ClmmTools = { instrument: any; Clmm: any };
 
-async function loadClmmTools(connection: Connection): Promise<ClmmTools> {
-  let cached = clmmClientCache.get(connection);
+const clmmClientCache = new WeakMap<Connection, Promise<ClmmTools>>();
+async function loadClmmTools(_connection: Connection): Promise<ClmmTools> {
+  let cached = clmmClientCache.get(_connection);
   if (!cached) {
     cached = (async () => {
-      const { Raydium, Clmm, Api, ClmmInstrument } = await sdkModulePromise;
-      const api = new Api({ cluster: 'mainnet' });
-      const raydium = new Raydium({ connection, api });
-      const clmm = new Clmm({ scope: raydium, moduleName: 'Clmm' });
-      return { clmm, instrument: ClmmInstrument };
+      const { ClmmInstrument, Clmm } = await sdkModulePromise;
+      return { instrument: ClmmInstrument, Clmm };
     })();
-    clmmClientCache.set(connection, cached);
+    clmmClientCache.set(_connection, cached);
   }
   return cached;
 }
@@ -220,14 +273,14 @@ export function makeRayClmmEdge(
         config: { id: apiItem.config.id },
       };
 
-      // 2) On-chain keys → poolKeys (vaults/obs/lookupTable)
-      const { clmm, instrument: ClmmInstrument } = await loadClmmTools(connection);
-      const poolKeys: ClmmKeys = await clmm.getClmmPoolKeys(id);
+      // 2) Keys & instrument tools
+      const { instrument: ClmmInstrument, Clmm } = await loadClmmTools(connection);
+      const poolKeys: ClmmKeys = jsonInfo2PoolKeys(apiItem as any);
       if (!poolKeys?.vault?.A || !poolKeys?.vault?.B) {
         throw new Error(`raydium: failed to load pool vaults on-chain for ${id}`);
       }
 
-      const observationId = new PublicKey(poolKeys.observationId);
+      const observationId = mustPk((poolKeys as any).observationId, 'poolKeys.observationId');
 
       // Validate keys we need
       const mintA_pk = mustPk(poolInfo.mintA.address, 'poolInfo.mintA.address');
@@ -267,27 +320,30 @@ export function makeRayClmmEdge(
       const instrumentInputMint = inputMintPk; // the actual input side
       const amountInBn = new BN(amountIn.toString());
       const minOutBn = new BN(minOut.toString());
-      // BEFORE calling the instrument, fetch the tick arrays (remainingAccounts)
-      // Raydium wants “byAmountIn” when you pass input amount.
-      // It returns the tick-array PDAs you must include in remainingAccounts.
-      const comp = await clmm.fetchComputeClmmInfo({
+      const computeFn = (Clmm as any)?.fetchComputeClmmInfo;
+      if (typeof computeFn !== 'function') {
+        throw new Error('raydium: Clmm.fetchComputeClmmInfo unavailable');
+      }
+
+      const compute = await computeFn({
+        connection,
         poolInfo,
         poolKeys,
+        ownerInfo,
         inputMint: instrumentInputMint,
-        amount: amountInBn,
-        byAmountIn: true,
+        amountIn: amountInBn,
+        amountOutMin: minOutBn,
       });
 
-      // Some SDK builds return { remainingAccounts, sqrtPriceLimitX64? }
-      const computedRemaining = comp?.remainingAccounts ?? [];
-      const computedLimit =
-        comp?.sqrtPriceLimitX64 ??
+      const sqrtPriceLimitX64 =
+        compute?.sqrtPriceLimitX64 ??
         (instrumentInputMint.equals(mintA_pk)
           ? MIN_SQRT_PRICE_X64.add(ONE)
           : MAX_SQRT_PRICE_X64.sub(ONE));
 
-      // Sanity: CLMM swaps normally require ≥1 tick array; fail fast if none
-      if (computedRemaining.length === 0) {
+      const remainingAccounts = compute?.remainingAccounts ?? [];
+
+      if (remainingAccounts.length === 0) {
         throw new Error('raydium: no tick arrays returned for swap (remainingAccounts empty)');
       }
 
@@ -306,9 +362,9 @@ export function makeRayClmmEdge(
           inputMint: instrumentInputMint.toBase58(),
           amountIn: amountIn.toString(),
           minOut: minOut.toString(),
-          sqrtLimit: computedLimit.toString(),
+          sqrtLimit: sqrtPriceLimitX64.toString(),
           lut: poolKeys.lookupTableAccount ?? null,
-          remainingAccounts: computedRemaining.map((m: any) =>
+          remainingAccounts: remainingAccounts.map((m: any) =>
             m?.pubkey ? m.pubkey.toBase58?.() ?? String(m.pubkey) : String(m),
           ),
         });
@@ -323,8 +379,8 @@ export function makeRayClmmEdge(
         inputMint: instrumentInputMint,
         amountIn: amountInBn,
         amountOutMin: minOutBn,
-        sqrtPriceLimitX64: computedLimit,
-        remainingAccounts: computedRemaining,
+        sqrtPriceLimitX64,
+        remainingAccounts,
       });
 
       const rayIxs: TransactionInstruction[] =
